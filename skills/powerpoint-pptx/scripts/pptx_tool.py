@@ -151,6 +151,13 @@ def cmd_slides(a):
         print("一次對話讀太多張圖，部分平台會拒絕請求（例如 content safety screening），單頁圖盡量少開。")
     else:
         print("用 read 工具打開 PNG 檢查每一頁有沒有文字超出、重疊。")
+    if "pywin32" in rep[-1]:
+        if office_convert.layout_issues:
+            print(f"PowerPoint 實際排版檢查：{len(office_convert.layout_issues)} 個問題（一定要修，總覽圖不一定看得出來）")
+            for m in office_convert.layout_issues:
+                print("WARN " + m)
+        else:
+            print("PowerPoint 實際排版檢查：沒有東西超出投影片或超出文字框")
 
 
 def cmd_office(a):

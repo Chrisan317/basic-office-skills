@@ -208,6 +208,39 @@ def _slide_ratio(pptx):
         return 9 / 16
 
 
+layout_issues = []  # 最近一次 pywin32 匯出時，PowerPoint 實際排版量到的問題
+
+
+def _layout_check(p):
+    """用 PowerPoint 實際排版後的大小檢查：超出投影片、文字超出自己的框。
+    （python-pptx 只知道設定的列高；PowerPoint 會把放不下的表格列撐高，只有這裡量得到。）"""
+    out = []
+    W, H = p.PageSetup.SlideWidth, p.PageSetup.SlideHeight
+    for i in range(1, p.Slides.Count + 1):
+        for sh in p.Slides.Item(i).Shapes:
+            try:
+                name = sh.Name
+                text = ""
+                if sh.HasTextFrame and sh.TextFrame.HasText:
+                    text = sh.TextFrame.TextRange.Text.replace("\r", " ").replace("\x0b", " ").strip()[:16]
+                    name = f"「{text}」"
+                elif sh.HasTable:
+                    name = "表格"
+                bottom, right = sh.Top + sh.Height, sh.Left + sh.Width
+                if bottom > H + 3 or right > W + 3:
+                    out.append(f"第 {i} 頁：{name} 超出投影片（下緣 {bottom / 72:.2f} 吋／投影片高 {H / 72:.2f} 吋）")
+                elif text:
+                    tr = sh.TextFrame.TextRange
+                    tb = tr.BoundTop + tr.BoundHeight
+                    if tb > H + 3:
+                        out.append(f"第 {i} 頁：{name} 的文字超出投影片底部")
+                    elif tb > bottom + 6 and sh.TextFrame.AutoSize == 0:
+                        out.append(f"第 {i} 頁：{name} 的文字超出自己的框 {(tb - bottom) / 72:.2f} 吋（可能蓋到下面的東西）")
+            except Exception:
+                continue
+    return out
+
+
 def _slides_pywin32(pptx, outdir, width, height):
     import win32com.client  # noqa: 需要 pywin32
     app = win32com.client.DispatchEx("PowerPoint.Application")
@@ -215,6 +248,10 @@ def _slides_pywin32(pptx, outdir, width, height):
         p = app.Presentations.Open(pptx, ReadOnly=True, WithWindow=False)
         for i in range(1, p.Slides.Count + 1):
             p.Slides.Item(i).Export(os.path.join(outdir, f"slide_{i:03d}.png"), "PNG", width, height)
+        try:
+            layout_issues[:] = _layout_check(p)
+        except Exception:
+            layout_issues[:] = []
         p.Close()
     finally:
         app.Quit()
@@ -236,6 +273,7 @@ def export_slides(pptx, outdir=None, width=1600, report=None):
         for f in done():
             os.remove(f)
     clear()
+    layout_issues[:] = []
     height = int(round(width * _slide_ratio(pptx)))
     if sys.platform == "win32":
         try:

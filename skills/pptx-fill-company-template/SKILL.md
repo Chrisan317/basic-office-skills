@@ -9,7 +9,9 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 直接複製來源投影片會把舊的母片、背景一起帶過來，永遠不會像範本。
 
 本技能的腳本在 `<skills 資料夾>/pptx-fill-company-template/scripts/`，以下用 `DIR` 代表。
-讀取、匯出圖片、轉 PDF 用 `powerpoint-pptx` 技能的 `pptx_tool.py`（以下用 `PPT` 代表）。
+讀取、匯出圖片、轉 PDF 用 `powerpoint-pptx` 技能的 `pptx_tool.py`（檔名是**底線**；以下用 `PPT` 代表）。
+它在本技能資料夾的**同一層**：`<skills 資料夾>/powerpoint-pptx/scripts/pptx_tool.py`，`init()` 也會印出完整路徑（`helpers.PPT`）。**不要搜尋、不要自己另寫一套讀簡報的程式。**
+`helpers.py` 很長，**不用整個讀**：要用的函式和參數都列在下面。
 分享本技能時要給**整個資料夾**（SKILL.md + scripts/）。
 
 ## 檔案
@@ -19,7 +21,7 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
     挑錯時在 init 之後自己指定：`H.BLUE = BLUE = "1F4E79"`（兩個都要改：函式預設值看 `H.BLUE`，你自己的程式看 `BLUE`），或 `init(..., theme=False)` 用預設色。
   - 顏色名稱：`BLUE` 主色（標題字、數字、表頭）、`NAVY` 深色字、`CLOUD` 淺色卡片底、`ZEBRA` 表格斑馬紋、`ICE`/`CYAN` 圖表輔色、`GRAY` 次要文字、`BLACK`、`WHITE`、`RED`
   - `new_slide("cover" | "content" | "section" | "closing" | 版面名稱, 標題)`：自動找範本中合適的版面
-  - `set_subtitle(s, 文字, nth=0)`：填副標預留位置（封面常有兩個：nth=0 講者、nth=1 日期）。內容頁會自動把副標移到標題下方、靠左
+  - `set_subtitle(s, 文字, nth=0)`：填副標預留位置（封面常有兩個：nth=0 講者、nth=1 日期）。內容頁會自動把副標移到標題下方、靠左；版面沒有副標預留位置時，會在標題下方補一個文字框
   - `content_area(slide)`：依投影片大小、標題、已填的副標，回傳可放內容的 (x, y, w, h)，16:9 / 4:3 都適用
   - **讀來源**（數值、文字一律用這些讀，不要手打、不要自己寫解析）：
     - `src_paras(頁)`：該頁所有文字框的文字，**一行一筆**、由上而下（同一個文字框裡的兩行會拆開）；`pos=True` 附位置
@@ -118,9 +120,11 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 - **整個對話的看圖張數越少越好（建議 10 張以內）**：圖片會一直留在對話裡、每次都重送。
   有些平台累積十幾張圖後會拒絕請求（例如 NVIDIA 的 `input rejected by content safety screening`），之後同一個對話怎麼重試都會失敗，只能開新對話。
 - 修改後重新匯出，只看改過的那幾頁或新的總覽圖，不要每頁重看。
-這個指令會自動處理：依序試 pywin32 → PowerShell（Office 是 32 位元時先用 32 位元 PowerShell）→ LibreOffice，並印出用了哪一種。**不要自己猜 PowerPoint 的路徑。**
+這個指令會自動處理：依序試 pywin32 → PowerShell（Office 是 32 位元時先用 32 位元 PowerShell）→ LibreOffice，並印出用了哪一種。
+- **不要自己找 PowerPoint**：`where powerpnt`、`Get-Command powerpnt` 一定找不到（Office 不在 PATH，32 位元裝在 `Program Files (x86)`）。**有沒有裝，以 `slides` 指令的結果為準。**
+- 用 PowerPoint 匯出時，最後會印出「**PowerPoint 實際排版檢查**」：PowerPoint 排版後真的超出投影片或文字框的東西（例如表格列被撐高、跑出投影片底部）。有 `WARN` 就要修，這比看圖準。
 
-都沒有時（沒有 PowerPoint 也沒有 LibreOffice）：
+`slides` 指令印出所有方法都失敗時（沒有 PowerPoint 也沒有 LibreOffice）：
 - 不要停在「無法輸出圖片」。告訴使用者，問可不可以安裝 LibreOffice（`winget install TheDocumentFoundation.LibreOffice`）。
 - 同時跑 `python -I "DIR/check_bounds.py" 輸出.pptx` 估算有沒有東西超出投影片。
 - 最後回報時清楚說明「沒有做視覺檢查」，並列出最擠的頁面（大表格）請使用者先看。

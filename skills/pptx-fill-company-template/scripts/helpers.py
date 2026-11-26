@@ -8,7 +8,7 @@ usage:  import helpers as H; from helpers import *; src, prs = init(SRC, TPL) ..
 版面：new_slide() 可以給範本的版面名稱，也可以給種類 "cover" / "content" / "section" / "closing"，
       會自動在範本裡找最適合的版面（找不到 closing/section 時回傳 None）。
 區域：content_area(slide) 回傳 (x, y, w, h)，依投影片大小、標題與已填的副標位置計算，16:9、4:3 都適用。"""
-import re, math, copy, sys
+import re, math, copy, sys, os
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
@@ -145,17 +145,26 @@ prs = None          # output deck, opened from the template
 L = {}              # template layout name -> layout
 orig_ids = []       # template sample slides, removed by save()
 warn = []           # overflow warnings collected by txt()
+# powerpoint-pptx 技能的工具（讀簡報、匯出圖片）：和本技能資料夾在同一層
+PPT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "..", "powerpoint-pptx", "scripts", "pptx_tool.py"))
 
 def init(src_path, tpl_path, theme=True):
     """Open source + template. Returns (src, prs). Call once before anything else.
     src_path may be None when the source is not a pptx (use extract_source.py for the content).
     theme=False：不讀範本主題色，保留目前的調色盤（例如你已經手動指定顏色）。"""
-    global src, prs, L, orig_ids
+    global src, prs
     src = Presentation(src_path) if src_path else None
     prs = Presentation(tpl_path)
-    orig_ids = list(prs.slides._sldIdLst)
-    L = {l.name: l for l in prs.slide_layouts}
+    # 就地更新（不要重新指定）：`from helpers import *` 拿到的 L、orig_ids 才不會是空的舊物件
+    orig_ids[:] = list(prs.slides._sldIdLst)
+    L.clear(); L.update({l.name: l for l in prs.slide_layouts})
     warn.clear()
+    print(f"範本版面 {len(L)} 個：" + "、".join(L))
+    if os.path.exists(PPT):
+        print(f'匯出圖片：python "{PPT}" slides 輸出.pptx -o _work/out_png')
+    else:
+        print(f"找不到 powerpoint-pptx 技能的 pptx_tool.py（預期在 {PPT}）")
     old = {n: globals()[n] for n in PALETTE_NAMES}
     if theme:
         apply_theme_palette(prs)
@@ -492,12 +501,22 @@ def set_subtitle(s, text, nth=0, align=None, pos=None):
     內容頁（有一般標題、副標預留位置又小又在上方）沒給 pos 時，會自動把副標移到標題正下方、
     寬度拉滿、靠左，之後 content_area() 會從副標下方開始。
     align：PP_ALIGN.LEFT 等（預留位置常繼承置中）。
-    pos：(x, y, w, h) 英吋，要自己指定位置時用。找不到預留位置回傳 None。"""
+    pos：(x, y, w, h) 英吋，要自己指定位置時用。
+    版面沒有副標預留位置時：內容頁會在標題下方加一個文字框代替（印出提示）；其他頁回傳 None 並警告。"""
     from pptx.enum.shapes import PP_PLACEHOLDER as P
     phs = sorted([ph for ph in s.placeholders
                   if ph.placeholder_format.type in (P.SUBTITLE, P.BODY) and ph.has_text_frame],
                  key=lambda ph: ph.placeholder_format.idx)
     if nth >= len(phs):
+        t = s.shapes.title
+        if nth == 0 and t is not None and t.top is not None:  # 內容頁：在標題下方補一個文字框
+            W, _ = slide_size()
+            x0, y0 = t.left / 914400, (t.top + t.height) / 914400
+            x0, y0, w0, h0 = pos or (x0, y0, W - x0 - 0.5, 0.45)
+            print(f"set_subtitle：版面「{s.slide_layout.name}」沒有副標預留位置，改在標題下方加文字框")
+            return txt(s, x0, y0, w0, h0, [dict(text=text, size=16, bold=True, color=BLUE)],
+                       align=align or PP_ALIGN.LEFT, name="Subtitle")
+        warn.append(f"set_subtitle：版面「{s.slide_layout.name}」沒有第 {nth} 個副標預留位置，「{text[:12]}」沒有放上去")
         return None
     ph = phs[nth]
     W, H = slide_size()
@@ -540,6 +559,9 @@ def content_area(s=None, margin=0.5, bottom=0.45):
                 continue
             if ph.top / 914400 < H * 0.3 and ph.height / 914400 < 1.0:
                 top = max(top, (ph.top + ph.height) / 914400 + 0.15)
+        for sh_ in s.shapes:  # set_subtitle 補的副標文字框
+            if sh_.name == "Subtitle" and not sh_.is_placeholder:
+                top = max(top, (sh_.top + sh_.height) / 914400 + 0.15)
     return margin, top, W - 2 * margin, H - top - bottom
 
 
@@ -593,7 +615,7 @@ def set_border(cell, side, color, w=6350):
 
 def cell_set(cell, text, size, bold=False, color=BLACK, fill=None, align=PP_ALIGN.LEFT, ml=0.06, mt=0.02):
     tf = cell.text_frame; tf.word_wrap = True
-    lines = text if isinstance(text, list) else [text]
+    lines = (text if isinstance(text, list) else [text]) or [""]  # 空 list（cell_lines 讀到空白格）也要設字級
     for i, ln in enumerate(lines):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.alignment = align
