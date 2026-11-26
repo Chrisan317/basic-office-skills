@@ -38,7 +38,7 @@ doc.save("輸出.docx")
 
 ## 轉 PDF
 `python "DIR/docx_tool.py" topdf "檔案.docx"`（Windows 用 Word 轉，沒有 Word 改用 LibreOffice）。
-- **不要自己猜 Word 的安裝路徑**（32 位元 Office 在 `Program Files (x86)`）。腳本會從登錄檔找，Word 自動化失敗時會自動改用 32 位元 PowerShell 再試。
+- **不要自己猜 Word 的安裝路徑**（32 位元 Office 在 `Program Files (x86)`）。腳本會從登錄檔找，依序試 pywin32 → PowerShell（Office 是 32 位元時先用 32 位元 PowerShell）→ LibreOffice。
 - 查 Office 裝在哪：`python "DIR/office_convert.py" find`
 
 ## 完成後驗證

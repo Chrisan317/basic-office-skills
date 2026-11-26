@@ -48,7 +48,8 @@ prs.save("輸出.pptx")
 - 每頁匯出 PNG：`python "TOOL" slides "簡報.pptx"`
 - 找 Office / LibreOffice 裝在哪：`python "TOOL" office`
 - **不要自己猜 PowerPoint 的路徑。** 32 位元 Office 在 `C:\Program Files (x86)\...`，64 位元在 `C:\Program Files\...`，每台電腦不一樣。
-  腳本會從登錄檔找，PowerPoint 自動化（COM）失敗時也會自動改用 32 位元 PowerShell 再試，最後才用 LibreOffice。
+  腳本會從登錄檔找，依序試 pywin32（64 位元 Python 也能控制 32 位元 Office）→ PowerShell（Office 是 32 位元時先用 32 位元 PowerShell）→ LibreOffice，
+  並印出是哪一種方法成功、哪幾種失敗。
 - 自己寫程式要用這些功能時：`sys.path.insert(0, r"DIR")` 再 `from office_convert import to_pdf, export_slides, find_app`（DIR = 本技能的 scripts 資料夾）。
 
 ## 完成後驗證

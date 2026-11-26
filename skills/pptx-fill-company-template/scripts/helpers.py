@@ -1,11 +1,13 @@
 """Reusable helpers for rebuilding a deck on a company template with python-pptx.
-usage:  import helpers as h; from helpers import *; src, prs = init(SRC, TPL) ... save(OUT)
+usage:  import helpers as H; from helpers import *; src, prs = init(SRC, TPL) ... save(OUT)
 
-顏色：init() 會從範本的佈景主題（theme）自動讀主色，更新 BLUE/NAVY/CYAN/CLOUD/ICE/ZEBRA。
-      因為 `from helpers import *` 拿到的是 import 當下的值，init 之後請用 h.BLUE、h.CLOUD 這種寫法取顏色。
+顏色：init() 會從範本的佈景主題（theme）自動挑顏色，更新 BLUE/NAVY/CYAN/CLOUD/ICE/ZEBRA/GRAY，並印出挑選結果。
+      主色 BLUE 不一定是 accent1：有些範本的 accent1 是很淺的底色，所以會挑「在白底上看得清楚、有彩度」的 accent。
+      init() 也會更新呼叫端 `from helpers import *` 拿到的同名變數，所以直接寫 BLUE、CLOUD 也可以；
+      用 H.BLUE 也行（別把模組取名成 h，h 常被拿來當「高度」變數而蓋掉模組）。
 版面：new_slide() 可以給範本的版面名稱，也可以給種類 "cover" / "content" / "section" / "closing"，
       會自動在範本裡找最適合的版面（找不到 closing/section 時回傳 None）。
-區域：content_area(slide) 回傳 (x, y, w, h)，依投影片大小與標題位置計算，16:9、4:3 都適用。"""
+區域：content_area(slide) 回傳 (x, y, w, h)，依投影片大小、標題與已填的副標位置計算，16:9、4:3 都適用。"""
 import re, math, copy, sys
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -17,17 +19,51 @@ from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_LABEL_POSITION
 from pptx.oxml.ns import qn
 from lxml import etree
 
+try:  # Windows 中文環境：輸出用 UTF-8，檔名、警告才不會變亂碼
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# 預設調色盤（範本讀不到主題色時使用）
 BLUE, CYAN, ICE, CLOUD, NAVY, GRAY, BLACK, WHITE = "0055CC", "00B0F0", "9DC3E6", "DAE3F3", "002145", "767171", "000000", "FFFFFF"
 ZEBRA = "F2F6FC"
 RED = "E03C31"
+PALETTE_NAMES = ("BLUE", "CYAN", "ICE", "CLOUD", "NAVY", "GRAY", "ZEBRA")
 
 def rgb(h): return RGBColor.from_string(h)
 
 
-def _mix(hex_color, white_ratio):
-    """把顏色和白色混合，white_ratio=0.85 代表 85% 白（做淺色卡片底色）。"""
+def _mix(hex_color, white_ratio, to="FFFFFF"):
+    """把顏色和白色（或 to）混合，white_ratio=0.85 代表 85% 白（做淺色卡片底色）。"""
+    c1 = [int(hex_color[i:i + 2], 16) for i in (0, 2, 4)]
+    c2 = [int(to[i:i + 2], 16) for i in (0, 2, 4)]
+    return "%02X%02X%02X" % tuple(round(a + (b - a) * white_ratio) for a, b in zip(c1, c2))
+
+
+def _lum(hex_color):
+    """WCAG 相對亮度 0（黑）～1（白）。"""
+    def ch(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
     r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-    return "%02X%02X%02X" % tuple(round(c + (255 - c) * white_ratio) for c in (r, g, b))
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+
+def _contrast(a, b="FFFFFF"):
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _hsv(hex_color):
+    import colorsys
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return colorsys.rgb_to_hsv(r, g, b)
+
+
+def _hue_near(a, b, deg=35):
+    d = abs(_hsv(a)[0] - _hsv(b)[0]) * 360
+    return min(d, 360 - d) <= deg
 
 
 def theme_colors(pres):
@@ -52,17 +88,55 @@ def theme_colors(pres):
         return {}
 
 
-def apply_theme_palette(pres):
-    """用範本的主題色更新調色盤：accent1 = 主色，dk2 = 深色標題，accent2 = 輔色。"""
-    global BLUE, CYAN, ICE, CLOUD, NAVY, ZEBRA
+def pick_palette(th):
+    """從主題色挑調色盤。回傳 {名稱: (顏色, 來源)}。
+    BLUE  主色：依 accent1→6 順序，第一個「白底上對比 ≥ 3、有彩度」的（很淺的 accent 會跳過）
+    CLOUD 卡片底：和主色同色系、很淺的 accent；沒有就用主色混 85% 白
+    ICE   淺色數列：和主色同色系、中等亮度的 accent；沒有就混 60% 白
+    CYAN  輔色：主色以外、彩度高、在白底看得到的 accent
+    GRAY  次要文字：低彩度、夠深的 accent；沒有就保留預設
+    NAVY  深色標題：dk2（夠深的話），否則把主色加深
+    ZEBRA 表格斑馬紋：主色混 95% 白"""
+    acc = [(f"accent{i}", th[f"accent{i}"]) for i in range(1, 7) if th.get(f"accent{i}")]
+    out = {}
+    if not acc:
+        return out
+    sat = lambda c: _hsv(c)[1]
+    # 依 accent1→6 的順序，取第一個「白底上對比 ≥ 3（大字/白字表頭看得清楚）且有彩度」的顏色
+    strong = [(n, c) for n, c in acc if _contrast(c) >= 3 and sat(c) >= 0.25]
+    if not strong:
+        return out  # 主題色都太淺或沒有彩度：保留預設調色盤
+    bn, blue = strong[0]
+    out["BLUE"] = (blue, bn)
+    light = [(n, c) for n, c in acc if _lum(c) >= 0.7 and 0.04 <= sat(c) and _hue_near(c, blue)]
+    out["CLOUD"] = light[0][::-1] if light else (_mix(blue, 0.85), f"{bn} 混 85% 白")
+    mid = [(n, c) for n, c in acc if 0.3 <= _lum(c) < 0.7 and sat(c) >= 0.15 and _hue_near(c, blue)
+           and c != blue]
+    out["ICE"] = mid[0][::-1] if mid else (_mix(blue, 0.6), f"{bn} 混 60% 白")
+    cyan = [(n, c) for n, c in acc if c not in (blue, out["ICE"][0]) and sat(c) >= 0.5 and _contrast(c) >= 1.8]
+    if cyan:
+        out["CYAN"] = cyan[0][::-1]
+    gray = [(n, c) for n, c in acc if sat(c) < 0.12 and _contrast(c) >= 3.5]
+    if gray:
+        out["GRAY"] = gray[0][::-1]
+    dk2 = th.get("dk2")
+    out["NAVY"] = (dk2, "dk2") if dk2 and _contrast(dk2) >= 7 else (_mix(blue, 0.55, "000000"), f"{bn} 加深")
+    out["ZEBRA"] = (_mix(blue, 0.95), f"{bn} 混 95% 白")
+    return out
+
+
+def apply_theme_palette(pres, verbose=True):
+    """用範本的主題色更新調色盤（見 pick_palette）。回傳主題色 dict。"""
     th = theme_colors(pres)
-    if th.get("accent1"):
-        BLUE = th["accent1"]
-        CLOUD, ICE, ZEBRA = _mix(BLUE, 0.85), _mix(BLUE, 0.6), _mix(BLUE, 0.94)
-    if th.get("dk2"):
-        NAVY = th["dk2"]
-    if th.get("accent2"):
-        CYAN = th["accent2"]
+    pal = pick_palette(th)
+    g = globals()
+    for name, (col, why) in pal.items():
+        g[name] = col
+    if verbose:
+        if pal:
+            print("調色盤（取自範本主題）：" + "、".join(f"{n}={c}（{w}）" for n, (c, w) in pal.items()))
+        else:
+            print("範本主題色讀不到或都太淺，使用預設調色盤")
     return th
 
 # ---------- state (set by init) ----------
@@ -72,16 +146,28 @@ L = {}              # template layout name -> layout
 orig_ids = []       # template sample slides, removed by save()
 warn = []           # overflow warnings collected by txt()
 
-def init(src_path, tpl_path):
+def init(src_path, tpl_path, theme=True):
     """Open source + template. Returns (src, prs). Call once before anything else.
-    src_path may be None when the source is not a pptx (use extract_source.py for the content)."""
+    src_path may be None when the source is not a pptx (use extract_source.py for the content).
+    theme=False：不讀範本主題色，保留目前的調色盤（例如你已經手動指定顏色）。"""
     global src, prs, L, orig_ids
     src = Presentation(src_path) if src_path else None
     prs = Presentation(tpl_path)
     orig_ids = list(prs.slides._sldIdLst)
     L = {l.name: l for l in prs.slide_layouts}
     warn.clear()
-    apply_theme_palette(prs)
+    old = {n: globals()[n] for n in PALETTE_NAMES}
+    if theme:
+        apply_theme_palette(prs)
+    # 呼叫端用 `from helpers import *` 拿到的是舊值：同名且還是舊值的就一起更新
+    try:
+        caller = sys._getframe(1).f_globals
+        if caller is not globals():
+            for n in PALETTE_NAMES:
+                if caller.get(n) == old[n]:
+                    caller[n] = globals()[n]
+    except Exception:
+        pass
     return src, prs
 
 def save(out_path):
@@ -160,14 +246,35 @@ def new_slide(layout, title=None):
     return s
 
 
-def set_subtitle(s, text):
-    """把文字放進第一個副標題/內文預留位置（不同範本的 idx 不同，不要寫死 idx）。"""
+def set_subtitle(s, text, nth=0, align=None, pos=None):
+    """把文字放進第 nth 個（從 0 起算）副標題/內文預留位置；不同範本的 idx 不同，不要寫死 idx。
+    封面常有兩個：nth=0 放講者/部門、nth=1 放日期。
+    內容頁（有一般標題、副標預留位置又小又在上方）沒給 pos 時，會自動把副標移到標題正下方、
+    寬度拉滿、靠左，之後 content_area() 會從副標下方開始。
+    align：PP_ALIGN.LEFT 等（預留位置常繼承置中）。
+    pos：(x, y, w, h) 英吋，要自己指定位置時用。找不到預留位置回傳 None。"""
     from pptx.enum.shapes import PP_PLACEHOLDER as P
-    for ph in s.placeholders:
-        if ph.placeholder_format.type in (P.SUBTITLE, P.BODY) and ph.has_text_frame:
-            ph.text = text
-            return ph
-    return None
+    phs = sorted([ph for ph in s.placeholders
+                  if ph.placeholder_format.type in (P.SUBTITLE, P.BODY) and ph.has_text_frame],
+                 key=lambda ph: ph.placeholder_format.idx)
+    if nth >= len(phs):
+        return None
+    ph = phs[nth]
+    W, H = slide_size()
+    t = s.shapes.title
+    is_content = t is not None and t.placeholder_format.type == P.TITLE
+    if pos is None and is_content and ph.top is not None and ph.top / 914400 < H * 0.3             and ph.height / 914400 < 1.0 and t.top is not None:
+        tb = (t.top + t.height) / 914400
+        pos = (t.left / 914400, tb, W - t.left / 914400 - 0.5, 0.45)
+        if align is None:
+            align = PP_ALIGN.LEFT
+    if pos:
+        ph.left, ph.top, ph.width, ph.height = (Inches(v) for v in pos)
+    ph.text = text
+    if align is not None:
+        for p in ph.text_frame.paragraphs:
+            p.alignment = align
+    return ph
 
 
 def drop_empty_placeholders(s):
@@ -181,12 +288,18 @@ def slide_size():
 
 
 def content_area(s=None, margin=0.5, bottom=0.45):
-    """回傳可放內容的 (x, y, w, h)（英吋）：左右留 margin，從標題下方開始。"""
+    """回傳可放內容的 (x, y, w, h)（英吋）：左右留 margin，從標題（和已填的副標）下方開始。"""
     W, H = slide_size()
-    top = 1.2
-    if s is not None and s.shapes.title is not None and s.shapes.title.top is not None:
+    top = 1.2 * H / 7.5
+    if s is not None:
         t = s.shapes.title
-        top = max(top * H / 7.5, (t.top + t.height) / 914400 + 0.15)
+        if t is not None and t.top is not None:
+            top = max(top, (t.top + t.height) / 914400 + 0.15)
+        for ph in s.placeholders:  # 已填字、位在上方的小預留位置（副標）
+            if ph is t or not ph.has_text_frame or not ph.text_frame.text.strip() or ph.top is None:
+                continue
+            if ph.top / 914400 < H * 0.3 and ph.height / 914400 < 1.0:
+                top = max(top, (ph.top + ph.height) / 914400 + 0.15)
     return margin, top, W - 2 * margin, H - top - bottom
 
 
@@ -305,8 +418,10 @@ def walk_shapes(shs):
         if sh_.shape_type == 6: yield from walk_shapes(sh_.shapes)
         else: yield sh_
 
-def bar_line_combo(chart, line_series_index, color=BLUE, labels=True):
-    """Turn one series of a clustered bar/column chart into a line on the same axes (combo chart)."""
+def bar_line_combo(chart, line_series_index, color=None, labels=True):
+    """Turn one series of a clustered bar/column chart into a line on the same axes (combo chart).
+    color 預設用 init() 之後的主色 BLUE。"""
+    color = color or BLUE
     C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
     A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
     bar = chart._chartSpace.find(".//{%s}barChart" % C_NS)
@@ -328,4 +443,259 @@ def bar_line_combo(chart, line_series_index, color=BLUE, labels=True):
     for ax in bar.findall("{%s}axId" % C_NS):
         etree.SubElement(line, "{%s}axId" % C_NS).set("val", ax.get("val"))
     bar.addnext(line)
+
+
+# =====================================================================
+# 常用版型：不含任何內容，給對應腳本直接呼叫。位置預設用 content_area(s)。
+# =====================================================================
+LINE = 1.3  # 中文字型實際行高約字級的 1.2–1.35 倍，估高度時用 1.3
+
+
+def lines_needed(text, size, w_in):
+    """一段文字在寬 w_in 吋、字級 size 時大約幾行（會算換行字元，並預留斷字的浪費）。"""
+    n = 0
+    for part in str(text).split("\n"):
+        n += max(1, math.ceil(text_w(part, size) * 1.08 / max(w_in * 72, 1)))
+    return n
+
+
+def row_height(cells, widths, size, min_h=0.3, pad=0.1):
+    """表格一列需要的高度（吋）。cells 的每格可以是字串或字串 list（多個段落）。"""
+    n = 1
+    for v, w in zip(cells, widths):
+        parts = v if isinstance(v, list) else [v]
+        n = max(n, sum(lines_needed(p, size, w - 0.14) for p in parts) if parts else 1)
+    return max(min_h, n * size * LINE / 72 + pad)
+
+
+def col_widths(rows, size, total, min_w=0.6, max_w=5.0):
+    """依內容長度分配欄寬，總寬 total 吋。"""
+    def flat(v): return " ".join(v) if isinstance(v, list) else str(v)
+    ncol = max(len(r) for r in rows)
+    w = [max(min_w, min(max(text_w(flat(r[c]), size) for r in rows if c < len(r)) / 72 + 0.3, max_w))
+         for c in range(ncol)]
+    return fit(w, total)
+
+
+def paginate(heights, caps):
+    """把列高分頁。caps：每頁可用高度（list，最後一個值用在之後所有頁）。
+    頁數最少，且盡量讓各頁一樣高（不會最後一頁只剩一兩列）。回傳 [[列索引...], ...]。"""
+    def greedy(limit):
+        pages, cur, used = [], [], 0.0
+        for i, hh in enumerate(heights):
+            cap = min(limit, caps[min(len(pages), len(caps) - 1)])
+            if cur and used + hh > cap:
+                pages.append(cur); cur, used = [], 0.0
+            cur.append(i); used += hh
+        pages.append(cur)
+        return pages
+    if not heights:
+        return [[]]
+    best = greedy(max(caps))
+    n = len(best)
+    if n == 1:
+        return best
+    lo, hi = max(max(heights), sum(heights) / n) * 0.999, max(caps)
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if len(greedy(mid)) <= n:
+            hi = mid
+        else:
+            lo = mid
+    return greedy(hi)
+
+
+def is_num(t):
+    t = " ".join(t) if isinstance(t, list) else str(t)
+    return bool(re.fullmatch(r"[-+]?[\d,.]+\s*%?", t.strip()))
+
+
+def table_pages(title, rows, first=None, top=None, sizes=(16, 14, 12, 11, 10), widths=None,
+                bold_last=False, aligns=None, layout="content", name="資料表", fill_ratio=0.55):
+    """把表格（rows[0] 是表頭）放進一頁或多頁內容頁，回傳用到的投影片 list。
+    - 自動挑字級：在「頁數最少」的前提下用最大的字級（小表格會放大，不會縮在左上角）。
+    - 依每列文字的換行數估列高，分頁時讓各頁一樣高；多頁時標題加 (1/n)。
+    - first：已建立的投影片當第一頁（上方已放說明文字時，用 top 指定表格起點 y）。
+    - aligns：{欄: PP_ALIGN}；沒給時數字欄置中。bold_last：最後一列（合計）粗體＋淺底。"""
+    ncol = max(len(r) for r in rows)
+    rows = [(list(r) + [""] * ncol)[:ncol] for r in rows]
+    head, body = rows[0], rows[1:]
+    s0 = first or new_slide(layout, title)
+    x, y, cw, ch = content_area(s0)
+    y1 = top if top is not None else y
+    avail1, avail = ch - (y1 - y), ch
+    best = None
+    for size in sorted(sizes, reverse=True):
+        w = widths or col_widths(rows, size, cw)
+        min_h = size * LINE / 72 + 0.12
+        hh = row_height(head, w, size, min_h) + 0.04
+        bh = [row_height(r, w, size, min_h) for r in body]
+        pages = paginate(bh, [avail1 - hh, avail - hh])
+        cand = (len(pages), size, w, hh, bh, pages)
+        if best is None or len(pages) < best[0]:
+            best = cand
+    npg = best[0]
+    for size in sorted(sizes, reverse=True):  # 同樣頁數下用最大字級
+        w = widths or col_widths(rows, size, cw)
+        min_h = size * LINE / 72 + 0.12
+        hh = row_height(head, w, size, min_h) + 0.04
+        bh = [row_height(r, w, size, min_h) for r in body]
+        pages = paginate(bh, [avail1 - hh, avail - hh])
+        if len(pages) == npg:
+            best = (npg, size, w, hh, bh, pages)
+            break
+    _, size, w, hh, bh, pages = best
+    if aligns is None:
+        aligns = {c: C for c in range(ncol) if c > 0 and all(is_num(r[c]) for r in body if r[c])}
+    slides = []
+    for pi, idx in enumerate(pages):
+        t_title = title + (f" ({pi + 1}/{len(pages)})" if len(pages) > 1 else "")
+        if pi == 0:
+            s = s0
+            if s.shapes.title is not None:
+                s.shapes.title.text = t_title
+            ty, cap = y1, avail1
+        else:
+            s = new_slide(layout, t_title)
+            ty, cap = y, avail
+        hs = [bh[i] for i in idx]
+        if len(pages) == 1 and hh + sum(hs) < cap * fill_ratio:  # 少列的表：列高放大一點比較好讀
+            k = min(1.5, cap * fill_ratio / (hh + sum(hs)))
+            hs = [v * k for v in hs]
+        if ty + hh + sum(hs) > ty + cap + 0.05:
+            warn.append(f"table '{t_title}' 估計高度 {hh + sum(hs):.2f} 超過可用 {cap:.2f}")
+        t = table(s, x, ty, w, len(idx) + 1, [hh] + hs, name=name)
+        style_header_row(t, 0, head, size)
+        part = [body[i] for i in idx]
+        zebra_body(t, 1, part, size, aligns, bold_last=bold_last and pi == len(pages) - 1)
+        slides.append(s)
+    return slides
+
+
+def stat_cards(s, items, x=None, y=None, w=None, h=1.4, gap=0.25, value_size=36):
+    """一排數字卡片：小標籤（灰）＋大數字（主色）＋單位（灰）。
+    items：[(標籤, 數值), (標籤, 數值, 單位), ...]。回傳卡片下緣的 y。"""
+    ax, ay, aw, _ = content_area(s)
+    x = ax if x is None else x
+    y = ay if y is None else y
+    w = aw if w is None else w
+    n = len(items)
+    cw = (w - gap * (n - 1)) / n
+    for i, it in enumerate(items):
+        lab, val, unit = (list(it) + ["", ""])[:3]
+        cx = x + i * (cw + gap)
+        box(s, cx, y, cw, h, CLOUD)
+        txt(s, cx + 0.15, y + 0.08, cw - 0.3, 0.4, [dict(text=str(lab), size=14, color=GRAY)])
+        vs = value_size
+        while vs > 18 and text_w(str(val), vs) + text_w(" " + str(unit), 16) > (cw - 0.4) * 72:
+            vs -= 2
+        runs = [dict(text=str(val), size=vs, bold=True, color=BLUE)]
+        if unit:
+            runs.append(dict(text=" " + str(unit), size=16, color=GRAY))
+        txt(s, cx + 0.15, y + 0.45, cw - 0.3, h - 0.5, [dict(runs=runs, size=vs)])
+    return y + h
+
+
+def agenda(s, items, gap=0.25):
+    """目錄頁：編號＋項目的卡片。5 項以內排一列，更多排兩列。"""
+    x, y, w, hh = content_area(s)
+    n = len(items)
+    cols = n if n <= 5 else math.ceil(n / 2)
+    rws = math.ceil(n / cols)
+    cw = (w - gap * (cols - 1)) / cols
+    ch = min(3.4, (hh - 0.3 - gap * (rws - 1)) / rws)
+    y0 = y + max(0, (hh - (ch * rws + gap * (rws - 1))) / 2)
+    for i, it in enumerate(items):
+        cx, cy = x + (i % cols) * (cw + gap), y0 + (i // cols) * (ch + gap)
+        box(s, cx, cy, cw, ch, CLOUD)
+        ns = 54 if ch >= 2.5 else 36
+        txt(s, cx + 0.2, cy + 0.25, cw - 0.4, ns / 72 * 1.3 + 0.1, [dict(text=f"{i + 1:02d}", size=ns, bold=True, color=BLUE)])
+        size = 28 if cw >= 2.5 else 20
+        while size > 14 and lines_needed(it, size, cw - 0.5) > 2:
+            size -= 2
+        txt(s, cx + 0.2, cy + ch * 0.56, cw - 0.4, ch * 0.4, [dict(text=it, size=size, bold=True, color=NAVY)])
+
+
+def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None):
+    """多張卡片排成格狀（例如 2×2）。cards：[(卡片標題, 項目 list), ...]；
+    項目可以是字串，或 (主文字, 灰色補充說明)。回傳卡片的 (x, y, w, h) list。"""
+    x, y, w, hh = area or content_area(s)
+    n = len(cards)
+    rws = math.ceil(n / cols)
+    cw, ch = (w - gap * (cols - 1)) / cols, (hh - gap * (rws - 1)) / rws
+    out = []
+    for i, (ttl, items) in enumerate(cards):
+        cx, cy = x + (i % cols) * (cw + gap), y + (i // cols) * (ch + gap)
+        box(s, cx, cy, cw, ch, CLOUD)
+        txt(s, cx + 0.2, cy + 0.12, cw - 0.4, 0.45, [dict(text=ttl, size=title_size, bold=True, color=BLUE)])
+        paras = []
+        for it in items:
+            if isinstance(it, (tuple, list)):
+                main, sub = (list(it) + [""])[:2]
+                paras.append(dict(text=main, size=body_size, bold=True, color=BLACK, after=0 if sub else 4))
+                if sub:
+                    paras.append(dict(text=sub, size=body_size - 2, color=GRAY, after=6))
+            else:
+                paras.append(dict(text=it, size=body_size, color=BLACK, after=6))
+        if paras:
+            txt(s, cx + 0.2, cy + 0.65, cw - 0.4, ch - 0.75, paras)
+        out.append((cx, cy, cw, ch))
+    return out
+
+
+def progress_bar(s, x, y, w, pct, h=0.14, track=None, color=None):
+    """進度條（例如達成率）。pct 是 0–100。"""
+    for ww, col in ((w, track or WHITE), (max(w * min(float(pct), 100) / 100, 0.05), color or BLUE)):
+        r = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(ww), Inches(h))
+        r.fill.solid(); r.fill.fore_color.rgb = rgb(col); r.line.fill.background(); r.shadow.inherit = False
+
+
+def column_chart(s, categories, bars, line=None, area=None, colors=None, labels=True, name="圖表"):
+    """原生直條圖（可加一條折線，例如合計）。
+    bars：[(數列名稱, 數值 list), ...]；line：(名稱, 數值 list) 或 None。回傳 chart。"""
+    x, y, w, hh = area or content_area(s)
+    cd = CategoryChartData()
+    cd.categories = [str(c) for c in categories]
+    allv = []
+    for nm, vals in bars:
+        v = [float(a or 0) for a in vals]; allv += v
+        cd.add_series(nm, v)
+    if line:
+        cd.add_series(line[0], [float(a or 0) for a in line[1]])
+    gf = s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(x), Inches(y), Inches(w), Inches(hh), cd)
+    gf.name = name
+    ch = gf.chart
+    nser = len(bars) + (1 if line else 0)
+    ch.has_legend = nser > 1
+    if ch.has_legend:
+        ch.legend.position = XL_LEGEND_POSITION.TOP
+        ch.legend.include_in_layout = False
+        ch.legend.font.size = Pt(12)
+    pal = colors or ([CYAN, ICE, NAVY, GRAY] if line else [BLUE, ICE, CYAN, NAVY, GRAY])
+    for se, col in zip(list(ch.plots[0].series)[:len(bars)], pal * 3):
+        se.format.fill.solid(); se.format.fill.fore_color.rgb = rgb(col)
+    if line:
+        bar_line_combo(ch, len(bars), BLUE, labels)
+    pl = ch.plots[0]
+    pl.gap_width = 60; pl.overlap = 0
+    if labels:
+        pl.has_data_labels = True
+        dl = pl.data_labels
+        dl.font.size = Pt(9)
+        whole = all(abs(v - round(v)) < 1e-9 for v in allv)
+        dl.number_format = "#,##0;-#,##0;;" if whole else "#,##0.0;-#,##0.0;;"
+        dl.number_format_is_linked = False
+        dl.position = XL_LABEL_POSITION.OUTSIDE_END
+    ca = ch.category_axis
+    ca.tick_labels.font.size = Pt(10)
+    ca.format.line.color.rgb = rgb(GRAY)
+    if len(categories) > 8 or max((text_w(str(c), 10) for c in categories), default=0) > 60:
+        txPr = ca._element.find(qn("c:txPr"))
+        if txPr is not None:
+            txPr.find(qn("a:bodyPr")).set("rot", "-2700000")
+    va = ch.value_axis
+    va.tick_labels.font.size = Pt(10)
+    va.major_gridlines.format.line.color.rgb = rgb(CLOUD)
+    va.format.line.fill.background()
+    return ch
 

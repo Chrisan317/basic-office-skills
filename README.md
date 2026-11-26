@@ -41,7 +41,8 @@ python -m pip install pymupdf python-docx openpyxl python-pptx pandas tabulate x
 ```
 
 Windows 上要把 Word/PPT 轉 PDF 或匯出投影片圖片，需要 Microsoft Office（建議裝 `pywin32`）或 LibreOffice。
-32 位元與 64 位元 Office 都支援：腳本會從登錄檔找安裝位置，COM 失敗時自動改用 32 位元 PowerShell。
+32 位元與 64 位元 Office 都支援（已在 64 位元 Python + 32 位元 Office 實測）：腳本會從登錄檔找安裝位置，
+依序試 pywin32 → PowerShell（Office 是 32 位元時先用 32 位元 PowerShell）→ LibreOffice，並印出用了哪一種。
 
 裝好後**重新啟動 agent**，應該能在技能清單（多數工具是輸入 `/`）看到 `pdf`、`word-docx` 等技能。
 

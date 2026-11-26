@@ -2,18 +2,25 @@
 真正交付時複製一份，依內容調整每一節要怎麼呈現。
 
 用法：python build_from_text.py SOURCE TEMPLATE.pptx OUT.pptx
-規則：封面（文件標題）→ 每一節一頁（條列/段落做成卡片，表格自動分頁）→ 結尾頁（範本有的話）
+規則：
+  封面（文件標題＋短副標）→ 目錄（3–8 個主章節時）→ 每一節：
+    - 2–4 個「短、含數字」的條列（例如「新客戶 12 家」）→ 數字卡片
+    - 段落/條列 → 淺色卡片，字級依數量調整；太多時分兩欄、再多就分頁 (1/n)
+    - 表格 → 自動挑字級、依文字換行估列高、分頁時各頁平均；表格前的短說明放在表格上方
+    - 小型數值表（2–12 列）→ 另加一頁原生直條圖（合計欄畫成折線）
+  → 結尾頁（範本有的話）
 版面自動偵測（cover / content / closing），顏色取自範本的佈景主題，尺寸依投影片大小計算（16:9、4:3 都可）。
+不摘要、不編造：所有文字都來自來源；只有「目錄」「概要」「圖表」這類頁面標籤是腳本加的。
 """
-import math
 import os
 import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import helpers as h  # noqa: E402
-from helpers import (C, box, est_h, fit, new_slide, save, set_subtitle, drop_empty_placeholders,  # noqa: E402
-                     content_area, style_header_row, table, text_w, txt, zebra_body, init)
+import helpers as H  # noqa: E402
+from helpers import (LINE, agenda, box, column_chart, content_area, drop_empty_placeholders,  # noqa: E402
+                     init, is_cjk, is_num, lines_needed, new_slide, paginate, save, set_subtitle,
+                     stat_cards, table_pages, txt)
 from extract_source import extract  # noqa: E402
 
 try:
@@ -24,96 +31,177 @@ except Exception:
 SRC, TPL, OUT = sys.argv[1:4]
 doc = extract(SRC)
 init(None, TPL)
+CJK = any(is_cjk(c) for c in doc["title"] + "".join(s["heading"] for s in doc["sections"]))
+LBL = dict(agenda="目錄", overview="概要", chart="圖表") if CJK else dict(agenda="Agenda", overview="Overview", chart="Chart")
+TOTAL = re.compile(r"^(合計|總計|小計|總和|total|sum|subtotal)$", re.I)
 
-# ---- 封面：文件標題 + 標題區第一段短文字當副標 ----
+# ---------------- 封面：文件標題 + 標題區第一段短文字當副標 ----------------
 s = new_slide("cover")
 if s.shapes.title is not None:
     s.shapes.title.text = doc["title"]
-first = next((b["text"] for sec in doc["sections"] for b in sec["blocks"]
-              if b["type"] == "paragraph" and len(b["text"]) <= 40), "")
-if first:
-    set_subtitle(s, first)
+used_sub = None
+for sec in doc["sections"]:
+    for b in sec["blocks"]:
+        if b["type"] == "paragraph" and len(b["text"]) <= 40:
+            used_sub = b
+            break
+    if used_sub or sec["blocks"]:
+        break
+if used_sub:
+    set_subtitle(s, used_sub["text"])
 drop_empty_placeholders(s)
 
+# ---------------- 整理章節 ----------------
+secs = []
+for sec in doc["sections"]:
+    blocks = [b for b in sec["blocks"] if b is not used_sub]
+    if not blocks:
+        continue
+    head = sec["heading"] or doc["title"]
+    if head == doc["title"]:
+        head = LBL["overview"]
+    secs.append((head, sec["level"], blocks))
 
-def is_num(t):
-    return bool(re.fullmatch(r"[-+]?[\d,.]+%?", t.strip()))
-
-
-def table_slides(title, rows):
-    ncol = max(len(r) for r in rows)
-    rows = [(r + [""] * ncol)[:ncol] for r in rows]
-    size = 12 if len(rows) <= 10 else 11 if len(rows) <= 16 else 10
-    probe = new_slide("content", title)            # 先開一頁量出內容區
-    x, y, cw, ch = content_area(probe)
-    w = [max(0.7, min(max(text_w(r[c], size) for r in rows) / 72 + 0.3, 5.0)) for c in range(ncol)]
-    w = fit(w, cw)
-
-    def row_h(r):
-        lines = max(max(1, math.ceil(text_w(v, size) / ((w[c] - 0.12) * 72))) for c, v in enumerate(r))
-        return max(0.34, lines * size * 1.25 / 72 + 0.1)
-
-    head_h = row_h(rows[0]) + 0.05
-    pages, cur, used = [], [], head_h
-    for r in rows[1:]:
-        h_ = row_h(r)
-        if cur and used + h_ > ch:
-            pages.append(cur)
-            cur, used = [], head_h
-        cur.append((r, h_))
-        used += h_
-    pages.append(cur)
-    if len(pages) > 1:                             # 平均分配，避免最後一頁只剩一兩列
-        allrows = [x_ for pg in pages for x_ in pg]
-        per = math.ceil(len(allrows) / len(pages))
-        pages = [allrows[k:k + per] for k in range(0, len(allrows), per)]
-    for i, pg in enumerate(pages, 1):
-        t_title = title + (f" ({i}/{len(pages)})" if len(pages) > 1 else "")
-        s = probe if i == 1 else new_slide("content", t_title)
-        if i == 1 and s.shapes.title is not None:
-            s.shapes.title.text = t_title
-        t = table(s, x, y, w, len(pg) + 1, [head_h] + [h_ for _, h_ in pg], name="資料表")
-        style_header_row(t, 0, rows[0], size)
-        zebra_body(t, 1, [r for r, _ in pg], size - 1 if size > 10 else size,
-                   {c: C for c in range(ncol) if all(is_num(r[c]) for r, _ in pg if r[c])})
+top_level = min((lv for _, lv, _ in secs), default=1)
+tops = [hd for hd, lv, _ in secs if lv == top_level and hd != LBL["overview"]]
+if 3 <= len(tops) <= 8:
+    s = new_slide("content", LBL["agenda"])
+    agenda(s, [re.sub(r"^\d+(\.\d+)*[.、)）]?\s*", "", t) for t in tops])
 
 
-def text_slide(title, blocks):
-    items = []
+# ---------------- 各種頁面 ----------------
+KPI = re.compile(r"^(?P<label>[^\d]*?)\s*(?P<val>[-+]?\d[\d,.]*)\s*(?P<unit>%|[^\d\s，,。.]{0,2})(?P<rest>.*)$")
+
+
+def parse_kpi(t):
+    """「新客戶 12 家」→ ("新客戶", "12", "家")。太長或沒有數字回傳 None。"""
+    if len(t) > 22:
+        return None
+    m = KPI.match(t.strip())
+    if not m or not m.group("label").strip():
+        return None
+    label = (m.group("label") + " " + m.group("rest")).strip()
+    return (label, m.group("val"), m.group("unit"))
+
+
+def card_h(paras, w):
+    return sum(lines_needed(p["text"], p["size"], w) * p["size"] * LINE / 72 + p["after"] / 72 for p in paras)
+
+
+def text_slides(head, items, first=None, top=None):
+    """items：[(文字, 是否條列)]。卡片高度跟著內容；放不下就分兩欄，再放不下就分頁。"""
+    s = first or new_slide("content", head)
+    x, y, w, hh = content_area(s)
+    y1 = top if top is not None else y
+    caps = [hh - (y1 - y) - 0.35, hh - 0.35]
+    gap = 0.23
+
+    def paras_of(its, size):
+        return [dict(text=("• " if bul else "") + t, size=size, color=H.BLACK, after=10 if size >= 16 else 8)
+                for t, bul in its]
+    choice = None
+    for size, cols in ((20, 1), (18, 1), (16, 1), (16, 2), (14, 2)):
+        if cols == 2 and len(items) < 4:
+            continue
+        cw = w if cols == 1 else (w - gap) / 2
+        hs = [card_h(paras_of([it], size), cw - 0.6) for it in items]
+        pages = paginate(hs, [c * cols for c in caps])
+        if len(pages) == 1 and len(paginate(hs, caps[:1])) <= cols:
+            choice = (size, cols, cw, hs, pages)
+            break
+    if choice is None:                              # 一頁放不下：16pt 兩欄分頁
+        size, cols = 16, 2
+        cw = (w - gap) / 2
+        hs = [card_h(paras_of([it], size), cw - 0.6) for it in items]
+        choice = (size, cols, cw, hs, paginate(hs, [c * cols for c in caps]))
+    size, cols, cw, hs, pages = choice
+    for pi, idx in enumerate(pages):
+        title = head + (f" ({pi + 1}/{len(pages)})" if len(pages) > 1 else "")
+        if pi == 0:
+            if s.shapes.title is not None:
+                s.shapes.title.text = title
+            sy, cap = y1, caps[0]
+        else:
+            s = new_slide("content", title)
+            sy, cap = y, caps[1]
+        if cols == 1:
+            columns = [idx]
+        else:                                       # 兩欄平均分：找最接近一半高度的切點
+            tot, acc, k = sum(hs[i] for i in idx), 0.0, 0
+            best = (tot, 0)
+            for j, i in enumerate(idx):
+                acc += hs[i]
+                best = min(best, (abs(tot - 2 * acc), j + 1))
+            k = best[1]
+            columns = [c for c in (idx[:k], idx[k:]) if c]
+        ch = min(cap + 0.35, max(1.2, max(sum(hs[i] for i in c) for c in columns) + 0.4))
+        for ci, col in enumerate(columns):
+            cx = x + ci * (cw + gap)
+            box(s, cx, sy, cw, ch, H.CLOUD)
+            txt(s, cx + 0.3, sy + 0.15, cw - 0.6, ch - 0.3, paras_of([items[i] for i in col], size),
+                name=f"內容{ci + 1}")
+
+
+def chart_slide(head, rows):
+    """小型數值表加一頁直條圖：第一欄當類別，數字欄當數列，合計欄畫成折線，合計列略過。"""
+    hdr, body = rows[0], [r for r in rows[1:] if not TOTAL.match(str(r[0]).strip())]
+    ncol = len(hdr)
+    num_cols = [c for c in range(1, ncol) if all(is_num(r[c]) for r in body if c < len(r) and r[c])
+                and any(c < len(r) and r[c] for r in body)]
+    if not (2 <= len(body) <= 12 and 1 <= len(num_cols) <= 6):
+        return
+
+    def val(v):
+        try:
+            return float(str(v).replace(",", "").replace("%", "").strip() or 0)
+        except ValueError:
+            return 0.0
+    tot = [c for c in num_cols if TOTAL.match(str(hdr[c]).strip())]
+    bars = [(str(hdr[c]), [val(r[c]) for r in body]) for c in num_cols if c not in tot]
+    line = (str(hdr[tot[0]]), [val(r[tot[0]]) for r in body]) if len(tot) == 1 and bars else None
+    if not bars:
+        bars, line = [(str(hdr[tot[0]]), [val(r[tot[0]]) for r in body])], None
+    s = new_slide("content", f"{head}｜{LBL['chart']}" if CJK else f"{head} | {LBL['chart']}")
+    column_chart(s, [r[0] for r in body], bars, line)
+
+
+for head, level, blocks in secs:
+    items, kpis, tables = [], None, []
     for b in blocks:
         if b["type"] == "paragraph":
             items.append((b["text"], False))
         elif b["type"] == "bullets":
-            items += [(t, True) for t in b["items"]]
-    if not items:
-        return
-    s = new_slide("content", title)
-    x0, y0, aw, ah = content_area(s)
-    two = len(items) > 7
-    cols = [items[: (len(items) + 1) // 2], items[(len(items) + 1) // 2:]] if two else [items]
-    gap = 0.23
-    cw = aw if not two else (aw - gap) / 2
-    for i, col in enumerate(cols):
-        x = x0 + i * (cw + gap)
-        paras = [dict(text=("• " if bul else "") + t, size=16 if not two else 14, color=h.BLACK, after=10)
-                 for t, bul in col]
-        need = est_h([(p["text"], p["size"], p["after"]) for p in paras], cw - 0.7) + 0.4
-        ch = min(ah, max(1.4, need + 0.3))         # 卡片高度跟著內容
-        box(s, x, y0, cw, ch, h.CLOUD)
-        txt(s, x + 0.3, y0 + 0.15, cw - 0.6, ch - 0.3, paras, name=f"內容{i + 1}")
+            k = [parse_kpi(t) for t in b["items"]]
+            if kpis is None and 2 <= len(k) <= 4 and all(k):
+                kpis = k
+            else:
+                items += [(t, True) for t in b["items"]]
+        elif b["type"] == "table" and len(b["rows"]) > 1:
+            tables.append(b["rows"])
+    note = tables and not kpis and items and len(items) <= 2 and sum(len(t) for t, _ in items) <= 160
+    s, top = None, None
+    if kpis:
+        s = new_slide("content", head)
+        top = stat_cards(s, kpis) + 0.3
+    if items and not note:
+        text_slides(head, items, first=s, top=top)
+        s, top = None, None
+    elif note:                                      # 表格前的短說明：放在表格上方
+        s = new_slide("content", head)
+        x, y, w, _ = content_area(s)
+        paras = [dict(text=t, size=14, color=H.GRAY, after=4) for t, _ in items]
+        nh = card_h(paras, w - 0.1) + 0.1
+        txt(s, x, y, w, nh, paras, name="說明")
+        top = y + nh + 0.12
+    for ti, rows in enumerate(tables):
+        if ti > 0:
+            s, top = None, None
+        last = str(rows[-1][0]).strip() if rows[-1] else ""
+        table_pages(head, rows, first=s, top=top, bold_last=bool(TOTAL.match(last)))
+        chart_slide(head, rows)
+        s, top = None, None
 
-
-for sec in doc["sections"]:
-    head = sec["heading"] or doc["title"]
-    if sec["level"] == 1 and not any(b["type"] == "table" for b in sec["blocks"]) and \
-       all(b["type"] == "paragraph" and len(b["text"]) <= 40 for b in sec["blocks"]):
-        continue                                   # 標題區，已放在封面
-    text_slide(head, [b for b in sec["blocks"] if b["type"] != "table"])
-    for b in sec["blocks"]:
-        if b["type"] == "table" and len(b["rows"]) > 1:
-            table_slides(head, b["rows"])
-
-end = new_slide("closing")                         # 範本沒有結尾版面就略過
+end = new_slide("closing")                          # 範本沒有結尾版面就略過
 if end is not None:
     drop_empty_placeholders(end)
 save(OUT)

@@ -47,7 +47,8 @@
 - 路徑有中文或空格時，一定要用雙引號包起來。
 - **不要猜 Office 的安裝路徑**：32 位元 Office 在 `C:\Program Files (x86)\Microsoft Office\`，64 位元在 `C:\Program Files\Microsoft Office\`。
   要用 Word / Excel / PowerPoint 時，用技能腳本（它們會查登錄檔、兩邊都找），或用 COM（`New-Object -ComObject PowerPoint.Application`）不需要路徑。
-  COM 出現 `TYPE_E_CANTLOADLIBRARY` 時，改用 32 位元 PowerShell：`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`。
+  COM 出現 `TYPE_E_CANTLOADLIBRARY`，或 `$a.Presentations` 是 null（「不可在值為 Null 的運算式上呼叫方法」）時，通常是 Office 為 32 位元；
+  技能腳本會自動處理。自己寫 PowerShell 時改用 32 位元 PowerShell：`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`。
 - 長的內容（整份文件的文字）**寫到 .md 或 .txt 檔，再用 read 工具讀**，不要全部印在終端機，否則會被截斷。
 
 ## 檔案安全

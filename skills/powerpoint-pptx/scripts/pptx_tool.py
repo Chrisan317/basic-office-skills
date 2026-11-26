@@ -99,8 +99,11 @@ def cmd_topdf(a):
 
 
 def cmd_slides(a):
-    files = office_convert.export_slides(a.file, a.output)
-    print(f"已輸出 {len(files)} 張圖到: {os.path.dirname(files[0]) if files else a.output}")
+    rep = []
+    files = office_convert.export_slides(a.file, a.output, report=rep)
+    for r in rep[:-1]:
+        print(f"（{r}）")
+    print(f"已用 {rep[-1]} 輸出 {len(files)} 張圖到: {os.path.dirname(files[0]) if files else a.output}")
     print("用 read 工具打開 PNG 檢查每一頁有沒有文字超出、重疊。")
 
 

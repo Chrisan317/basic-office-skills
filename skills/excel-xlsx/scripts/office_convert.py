@@ -70,15 +70,28 @@ def describe():
     return "\n".join(lines)
 
 
+def _office_is_32bit():
+    p = find_app("POWERPNT.EXE") or find_app("WINWORD.EXE") or find_app("EXCEL.EXE")
+    return bool(p and "(x86)" in p)
+
+
 def _powershells():
-    """先用一般（64 位元）PowerShell，再用 32 位元 PowerShell。COM 在其中一邊壞掉時另一邊通常可以。"""
+    """回傳要試的 PowerShell（64 位元、32 位元）。
+    Office 是 32 位元時，64 位元 PowerShell 的 New-Object -ComObject 常常拿到不能用的物件
+    （例如 $a.Presentations 是 null），所以先試 32 位元 PowerShell。"""
     root = os.environ.get("SystemRoot", r"C:\Windows")
     out = []
     for sub in ("Sysnative", "System32", "SysWOW64"):  # Sysnative：32 位元 Python 呼叫 64 位元 PowerShell
         p = os.path.join(root, sub, "WindowsPowerShell", "v1.0", "powershell.exe")
         if os.path.isfile(p) and p not in out:
             out.append(p)
+    if _office_is_32bit():
+        out.sort(key=lambda p: 0 if "SysWOW64" in p else 1)
     return out
+
+
+def _ps_bits(ps):
+    return "32" if "SysWOW64" in ps else "64"
 
 
 def _ps_quote(s):
@@ -86,13 +99,17 @@ def _ps_quote(s):
 
 
 def _run_ps(script):
+    """依序用各個 PowerShell 執行，回傳成功的 powershell.exe 路徑；全部失敗時丟出各層的錯誤。"""
     errors = []
+    # 錯誤訊息改成 UTF-8 輸出，中文 Windows 才不會變亂碼
+    script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + script
     for ps in _powershells():
         r = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode == 0:
             return ps
-        errors.append(f"{ps}: {(r.stderr or r.stdout).strip()[:300]}")
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        errors.append(f"{_ps_bits(ps)} 位元 PowerShell: {msg[0][:200] if msg else r.returncode}")
     raise RuntimeError("\n".join(errors) or "找不到 PowerShell")
 
 
@@ -169,7 +186,7 @@ def to_pdf(src, dst=None):
             errors.append(f"pywin32: {e}")
         try:
             ps = _com_pdf_ps(kind, src, dst)
-            return f"Office（{'32' if 'SysWOW64' in ps else '64'} 位元 PowerShell）"
+            return f"Office（{_ps_bits(ps)} 位元 PowerShell）"
         except Exception as e:
             errors.append(f"PowerShell: {e}")
     try:
@@ -181,29 +198,69 @@ def to_pdf(src, dst=None):
                        "\n需要 Microsoft Office 或 LibreOffice（winget install TheDocumentFoundation.LibreOffice）")
 
 
-def export_slides(pptx, outdir=None, width=1600):
-    """每頁簡報輸出成 PNG，回傳圖片路徑清單。PowerPoint COM 優先，不行就轉 PDF 再用 PyMuPDF 轉圖。"""
+def _slide_ratio(pptx):
+    """投影片高/寬比例（16:9 = 0.5625、4:3 = 0.75）。"""
+    try:
+        from pptx import Presentation
+        p = Presentation(pptx)
+        return p.slide_height / p.slide_width
+    except Exception:
+        return 9 / 16
+
+
+def _slides_pywin32(pptx, outdir, width, height):
+    import win32com.client  # noqa: 需要 pywin32
+    app = win32com.client.DispatchEx("PowerPoint.Application")
+    try:
+        p = app.Presentations.Open(pptx, ReadOnly=True, WithWindow=False)
+        for i in range(1, p.Slides.Count + 1):
+            p.Slides.Item(i).Export(os.path.join(outdir, f"slide_{i:03d}.png"), "PNG", width, height)
+        p.Close()
+    finally:
+        app.Quit()
+
+
+def export_slides(pptx, outdir=None, width=1600, report=None):
+    """每頁簡報輸出成 PNG，回傳圖片路徑清單。
+    依序試：pywin32 COM → PowerShell COM（依 Office 位元數決定先試 32 或 64 位元）→ 轉 PDF 再用 PyMuPDF 轉圖。
+    report 給一個 list 時，會把使用的方法和失敗的層記進去。"""
     pptx = os.path.abspath(pptx)
     outdir = os.path.abspath(outdir or os.path.splitext(pptx)[0] + "_頁面圖")
     os.makedirs(outdir, exist_ok=True)
-    for f in glob.glob(os.path.join(outdir, "slide_*.png")):
-        os.remove(f)
+    report = report if report is not None else []
+
+    def done():
+        return sorted(glob.glob(os.path.join(outdir, "slide_*.png")))
+
+    def clear():
+        for f in done():
+            os.remove(f)
+    clear()
+    height = int(round(width * _slide_ratio(pptx)))
     if sys.platform == "win32":
-        h = int(width * 9 / 16)
+        try:
+            _slides_pywin32(pptx, outdir, width, height)
+            if done():
+                report.append("PowerPoint（pywin32）")
+                return done()
+        except Exception as e:
+            report.append(f"失敗 pywin32: {str(e)[:200]}")
+            clear()
         script = ("$ErrorActionPreference='Stop';$a=New-Object -ComObject PowerPoint.Application;"
                   f"$x=$a.Presentations.Open({_ps_quote(pptx)},-1,0,0);"
                   "for($i=1;$i -le $x.Slides.Count;$i++){"
-                  f"$x.Slides.Item($i).Export((Join-Path {_ps_quote(outdir)} ('slide_{{0:D3}}.png' -f $i)),'PNG',{width},{h})}};"
+                  f"$x.Slides.Item($i).Export((Join-Path {_ps_quote(outdir)} ('slide_{{0:D3}}.png' -f $i)),'PNG',{width},{height})}};"
                   "$x.Close();$a.Quit()")
         try:
-            _run_ps(script)
-            files = sorted(glob.glob(os.path.join(outdir, "slide_*.png")))
-            if files:
-                return files
+            ps = _run_ps(script)
+            if done():
+                report.append(f"PowerPoint（{_ps_bits(ps)} 位元 PowerShell）")
+                return done()
         except Exception as e:
-            print(f"[PowerPoint 匯出失敗，改用 PDF 轉圖] {e}", file=sys.stderr)
+            report.append(f"失敗 PowerShell: {e}")
+            clear()
     pdf = os.path.join(tempfile.mkdtemp(prefix="slides_"), "deck.pdf")
-    to_pdf(pptx, pdf)
+    how = to_pdf(pptx, pdf)
     try:
         import pymupdf
     except ImportError:
@@ -215,6 +272,7 @@ def export_slides(pptx, outdir=None, width=1600):
             p = os.path.join(outdir, f"slide_{i:03d}.png")
             page.get_pixmap(dpi=110).save(p)
             files.append(p)
+    report.append(f"{how} 轉 PDF → PyMuPDF")
     return files
 
 
@@ -232,8 +290,9 @@ def main():
         how = to_pdf(a.file, dst)
         print(f"已用 {how} 轉成: {os.path.abspath(dst)}")
     else:
-        files = export_slides(a.file, a.output)
-        print(f"已輸出 {len(files)} 張: {os.path.dirname(files[0]) if files else ''}")
+        rep = []
+        files = export_slides(a.file, a.output, report=rep)
+        print(f"已用 {rep[-1]} 輸出 {len(files)} 張: {os.path.dirname(files[0]) if files else ''}")
 
 
 if __name__ == "__main__":
