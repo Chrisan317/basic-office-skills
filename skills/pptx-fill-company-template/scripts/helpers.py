@@ -144,6 +144,7 @@ src = None          # source deck (content is read from here)
 prs = None          # output deck, opened from the template
 L = {}              # template layout name -> layout
 orig_ids = []       # template sample slides, removed by save()
+TPL_PATH = None     # template path (structure_check 用：範本本來就有的字不算自己加的)
 warn = []           # overflow warnings collected by txt()
 # powerpoint-pptx 技能的工具（讀簡報、匯出圖片）：和本技能資料夾在同一層
 PPT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -153,7 +154,8 @@ def init(src_path, tpl_path, theme=True):
     """Open source + template. Returns (src, prs). Call once before anything else.
     src_path may be None when the source is not a pptx (use extract_source.py for the content).
     theme=False：不讀範本主題色，保留目前的調色盤（例如你已經手動指定顏色）。"""
-    global src, prs
+    global src, prs, TPL_PATH
+    TPL_PATH = tpl_path
     src = Presentation(src_path) if src_path else None
     prs = Presentation(tpl_path)
     # 就地更新（不要重新指定）：`from helpers import *` 拿到的 L、orig_ids 才不會是空的舊物件
@@ -567,7 +569,40 @@ def structure_check(src_pres, out_pres):
     2. 內文裡又出現一次標題（把 src_paras() 整頁倒進去時常見）"""
     global src
     msgs = []
-    _, _, owner = _owners(src_pres, out_pres)
+    _, out_b, owner = _owners(src_pres, out_pres)
+    # 數字要留在自己那頁（MISSING 是整份比對，數字常在別頁碰巧出現，會漏掉）
+    for i, sl in enumerate(src_pres.slides):
+        mine = [k for k, o in enumerate(owner) if o == i]
+        if not mine:
+            continue
+        b = "".join(out_b[k] for k in mine)
+        nums = []
+        for _, _, t in _texts_of(sl.shapes):
+            for tok in re.findall(r"\d+(?:\.\d+)?%?", t):
+                if len(tok.rstrip("%")) >= 2 and tok not in b and tok not in nums:
+                    nums.append(tok)
+        if nums:
+            msgs.append(f"來源第 {i + 1} 頁的數字在輸出第 " + "、".join(str(k + 1) for k in mine) + " 頁找不到："
+                        + "、".join(nums[:10]) + (f" …等 {len(nums)} 個" if len(nums) > 10 else "")
+                        + "（常見：說明文字裡的數字被濃縮掉）。用 src_paras / src_cards 讀出來放上去")
+    # 來源和範本都沒有的長句：通常是自己寫的解釋或結論
+    known = _blob(src_pres)
+    try:
+        if TPL_PATH:
+            known += _blob(Presentation(TPL_PATH))
+    except Exception:
+        pass
+    for k, sl in enumerate(out_pres.slides):
+        extra = []
+        for _, _, t in _texts_of(sl.shapes):
+            for part in _SEP.split(t):
+                for tok in _RUN.findall(part):
+                    tok = tok.lower()
+                    if re.fullmatch(r"[^\x00-\x7f]{8,}", tok) and tok not in known and tok not in extra:
+                        extra.append(tok)
+        if extra:
+            msgs.append(f"第 {k + 1} 頁有來源沒有的文字：" + "、".join(extra[:4]) +
+                        "。不要自己寫解釋、結論或「來源沒有提供」這類說明；要說明的放在給使用者的回報裡")
     # 來源一頁變成好幾頁（table_pages 自動拆頁的標題有 (1/n)，那種由 table 的 WARN 處理）
     for i in sorted({o for o in owner if o is not None}):
         mine = [k for k, o in enumerate(owner) if o == i]
