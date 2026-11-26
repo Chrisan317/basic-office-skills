@@ -60,5 +60,9 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei"]; plt.rcParams["axes.unicode_minus"] = False
 ```
 
+## 轉 PDF
+`python "<skills 資料夾>/excel-xlsx/scripts/office_convert.py" topdf "報表.xlsx"`
+（會自己找 32/64 位元 Excel，沒有 Excel 改用 LibreOffice。不要自己猜 Excel 的安裝路徑。）
+
 ## 完成後驗證
 重新讀回輸出檔，確認列數、加總金額和原始資料對得上，並在回報中列出關鍵數字。

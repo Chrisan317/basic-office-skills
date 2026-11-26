@@ -9,7 +9,7 @@
 遇到任何任務（尤其是讀寫檔案、處理文件），照這個順序做：
 1. **先找技能**：看 available_skills 清單，有相關的技能就先用 skill 工具載入，照著做。
    - **專門技能只用在它說明的用途**：例如「審查測試報告」的技能，只在使用者要審查/檢查測試報告時用。機票、合約、發票、說明書這類一般文件，**不要**用專門技能，用下面的通用技能。
-   - 一般檔案用通用技能：PDF → `pdf`；Word/.docx → `word-docx`；Excel/.xlsx/.csv → `excel-xlsx`；PowerPoint/.pptx → `powerpoint-pptx`；寫信、會議記錄、報告 → `office-writing`
+   - 一般檔案用通用技能：PDF → `pdf`；Word/.docx → `word-docx`；Excel/.xlsx/.csv → `excel-xlsx`；PowerPoint/.pptx → `powerpoint-pptx`；把內容套到公司簡報範本（套版）→ `pptx-fill-company-template`；寫信、會議記錄、報告 → `office-writing`
 2. **沒有技能就自己寫程式**：用 Python 寫一個小腳本完成任務。缺套件就自己安裝：
    `python -m pip install 套件名稱`
 3. **失敗就修正**：讀錯誤訊息、改程式、換方法再試。至少試過 3 種不同方法，才可以回報做不到。（技能裡另有規定時，照技能的規定，見下方「技能的規則優先」）
@@ -45,6 +45,9 @@
   - 開檔加 `encoding="utf-8"`
   - 腳本開頭加 `import sys; sys.stdout.reconfigure(encoding="utf-8")`
 - 路徑有中文或空格時，一定要用雙引號包起來。
+- **不要猜 Office 的安裝路徑**：32 位元 Office 在 `C:\Program Files (x86)\Microsoft Office\`，64 位元在 `C:\Program Files\Microsoft Office\`。
+  要用 Word / Excel / PowerPoint 時，用技能腳本（它們會查登錄檔、兩邊都找），或用 COM（`New-Object -ComObject PowerPoint.Application`）不需要路徑。
+  COM 出現 `TYPE_E_CANTLOADLIBRARY` 時，改用 32 位元 PowerShell：`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`。
 - 長的內容（整份文件的文字）**寫到 .md 或 .txt 檔，再用 read 工具讀**，不要全部印在終端機，否則會被截斷。
 
 ## 檔案安全

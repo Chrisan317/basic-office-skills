@@ -14,7 +14,8 @@
 | `skills/pdf` | 抽文字＋表格、掃描檔 OCR（rapidocr，支援中文）、轉圖片給視覺模型看、合併/分割/旋轉 |
 | `skills/word-docx` | 讀成 Markdown、保留格式的批次取代、建立文件（已處理中文 eastAsia 字型）、轉 PDF、.doc 轉 .docx |
 | `skills/excel-xlsx` | 看結構、pandas 分析、做報表、加公式與格式、修改不洗掉原格式、CSV 自動判斷編碼（utf-8/cp950/big5） |
-| `skills/powerpoint-pptx` | 讀每頁內容與備忘稿、列出範本版面、用 python-pptx 建簡報、轉 PDF |
+| `skills/powerpoint-pptx` | 讀每頁內容與備忘稿、列出範本版面、用 python-pptx 建簡報、轉 PDF、每頁匯出 PNG |
+| `skills/pptx-fill-company-template` | 套版：把舊簡報或 md/txt/csv/xlsx/docx 的內容重建到任何公司範本上；自動偵測版面、讀範本主題色、16:9/4:3 皆可、表格自動分頁 |
 | `skills/office-writing` | 台灣職場文書格式：Email、會議記錄、週報、簽呈、公告、摘要 |
 | `skills/make-skill` | 說「把這個做法存成技能」，agent 會自己照規格建立新技能 |
 
@@ -39,7 +40,8 @@ Windows 的 `~` 是 `C:\Users\<你的帳號>`。
 python -m pip install pymupdf python-docx openpyxl python-pptx pandas tabulate xlrd
 ```
 
-Windows 上要把 Word/PPT 轉 PDF，另外需要 `pywin32` 和 Microsoft Office，或改裝 LibreOffice。
+Windows 上要把 Word/PPT 轉 PDF 或匯出投影片圖片，需要 Microsoft Office（建議裝 `pywin32`）或 LibreOffice。
+32 位元與 64 位元 Office 都支援：腳本會從登錄檔找安裝位置，COM 失敗時自動改用 32 位元 PowerShell。
 
 裝好後**重新啟動 agent**，應該能在技能清單（多數工具是輸入 `/`）看到 `pdf`、`word-docx` 等技能。
 

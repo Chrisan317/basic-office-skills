@@ -165,66 +165,55 @@ def cmd_replace(a):
     print(f"已輸出: {a.output}")
 
 
-def find_soffice():
-    for c in ("soffice", "soffice.exe",
-              r"C:\Program Files\LibreOffice\program\soffice.exe",
-              r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"):
-        if shutil.which(c) or os.path.exists(c):
-            return shutil.which(c) or c
-    return None
-
-
-def convert_with_word(src, dst, fmt):
-    """用 Windows 上的 Microsoft Word 轉檔。fmt: 17=PDF, 16=docx"""
-    ensure("win32com", "pywin32")
-    import win32com.client
-    word = win32com.client.DispatchEx("Word.Application")
-    word.Visible = False
-    try:
-        doc = word.Documents.Open(os.path.abspath(src), ReadOnly=True)
-        doc.SaveAs2(os.path.abspath(dst), FileFormat=fmt)
-        doc.Close(False)
-    finally:
-        word.Quit()
-
-
-def convert_with_soffice(src, outdir, target_ext):
-    soffice = find_soffice()
-    if not soffice:
-        raise RuntimeError("找不到 LibreOffice")
-    subprocess.check_call([soffice, "--headless", "--convert-to", target_ext, "--outdir", outdir, src])
-
-
-def convert(src, dst, fmt_word, ext):
-    errors = []
-    if sys.platform == "win32":
-        try:
-            convert_with_word(src, dst, fmt_word)
-            return "Word"
-        except Exception as e:
-            errors.append(f"Word: {e}")
-    try:
-        outdir = os.path.dirname(os.path.abspath(dst))
-        convert_with_soffice(src, outdir, ext)
-        produced = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + "." + ext)
-        if os.path.abspath(produced) != os.path.abspath(dst):
-            shutil.move(produced, dst)
-        return "LibreOffice"
-    except Exception as e:
-        errors.append(f"LibreOffice: {e}")
-    sys.exit("轉檔失敗：\n" + "\n".join(errors) + "\n需要安裝 Microsoft Word 或 LibreOffice")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import office_convert  # noqa: E402  找 Office（32/64 位元）與轉檔
 
 
 def cmd_topdf(a):
     dst = a.output or os.path.splitext(a.file)[0] + ".pdf"
-    used = convert(a.file, dst, 17, "pdf")
-    print(f"已用 {used} 轉成: {dst}")
+    how = office_convert.to_pdf(a.file, dst)
+    print(f"已用 {how} 轉成: {os.path.abspath(dst)}")
 
 
 def cmd_fromdoc(a):
-    dst = a.output or os.path.splitext(a.file)[0] + ".docx"
-    used = convert(a.file, dst, 16, "docx")
-    print(f"已用 {used} 轉成: {dst}")
+    """.doc → .docx：pywin32 → PowerShell（64/32 位元）→ LibreOffice"""
+    src = os.path.abspath(a.file)
+    dst = os.path.abspath(a.output or os.path.splitext(a.file)[0] + ".docx")
+    errors = []
+    if sys.platform == "win32":
+        try:
+            ensure("win32com", "pywin32")
+            import win32com.client
+            w = win32com.client.DispatchEx("Word.Application")
+            try:
+                d = w.Documents.Open(src, ReadOnly=True)
+                d.SaveAs2(dst, FileFormat=16)
+                d.Close(False)
+            finally:
+                w.Quit()
+            print(f"已用 Word 轉成: {dst}")
+            return
+        except Exception as e:
+            errors.append(f"pywin32: {e}")
+        try:
+            q = office_convert._ps_quote
+            office_convert._run_ps("$ErrorActionPreference='Stop';$a=New-Object -ComObject Word.Application;"
+                                   f"$x=$a.Documents.Open({q(src)},$false,$true);$x.SaveAs2({q(dst)},16);"
+                                   "$x.Close($false);$a.Quit()")
+            print(f"已用 Word（PowerShell）轉成: {dst}")
+            return
+        except Exception as e:
+            errors.append(f"PowerShell: {e}")
+    so = office_convert.find_app("soffice.exe")
+    if so:
+        outdir = os.path.dirname(dst)
+        subprocess.check_call([so, "--headless", "--convert-to", "docx", "--outdir", outdir, src])
+        produced = os.path.join(outdir, os.path.splitext(os.path.basename(src))[0] + ".docx")
+        if os.path.abspath(produced) != dst:
+            shutil.move(produced, dst)
+        print(f"已用 LibreOffice 轉成: {dst}")
+        return
+    sys.exit("轉檔失敗：\n" + "\n".join(errors) + "\n需要 Microsoft Word 或 LibreOffice")
 
 
 def main():
@@ -237,7 +226,10 @@ def main():
     s = sub.add_parser("topdf"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_topdf)
     s = sub.add_parser("fromdoc"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_fromdoc)
     a = p.parse_args()
-    a.fn(a)
+    try:
+        a.fn(a)
+    except Exception as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

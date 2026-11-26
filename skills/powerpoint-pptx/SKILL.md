@@ -10,7 +10,11 @@ description: 讀取、建立、修改 PowerPoint 簡報（.pptx）：讀每頁�
 
 ## 讀取
 `python "TOOL" read "簡報.pptx"` → 輸出 `簡報_內容.md`（每頁標題、文字、表格、備忘稿），再用 read 工具讀。
-需要看版面設計：`python "TOOL" topdf "簡報.pptx"`，再用 `pdf` 技能的 render 轉圖片看。
+需要看版面設計：`python "TOOL" slides "簡報.pptx"` 每頁輸出成 PNG，再用 read 工具看圖。
+
+## 套用公司範本（套版）
+要把現有內容（簡報、Word、Excel、Markdown…）重做到公司範本上，改用 `pptx-fill-company-template` 技能。
+本技能處理一般的讀取、建立、修改。
 
 ## 建立簡報
 1. **有公司範本就一定用範本**。先看範本有哪些版面：`python "TOOL" layouts "範本.pptx"`
@@ -39,5 +43,13 @@ prs.save("輸出.pptx")
 用 `Presentation("原檔.pptx")` 開啟、修改、另存 `原檔_修改.pptx`。
 取代文字要逐個 run 改（`for r in p.runs: r.text = r.text.replace(...)`），才不會掉格式。
 
+## 轉 PDF、匯出圖片、找 PowerPoint
+- 轉 PDF：`python "TOOL" topdf "簡報.pptx"`
+- 每頁匯出 PNG：`python "TOOL" slides "簡報.pptx"`
+- 找 Office / LibreOffice 裝在哪：`python "TOOL" office`
+- **不要自己猜 PowerPoint 的路徑。** 32 位元 Office 在 `C:\Program Files (x86)\...`，64 位元在 `C:\Program Files\...`，每台電腦不一樣。
+  腳本會從登錄檔找，PowerPoint 自動化（COM）失敗時也會自動改用 32 位元 PowerShell 再試，最後才用 LibreOffice。
+- 自己寫程式要用這些功能時：`sys.path.insert(0, r"DIR")` 再 `from office_convert import to_pdf, export_slides, find_app`（DIR = 本技能的 scripts 資料夾）。
+
 ## 完成後驗證
-對輸出檔跑 `read` 檢查每頁內容；可以的話 `topdf` + render 看一兩頁有沒有文字超出版面。
+對輸出檔跑 `read` 檢查每頁內容，再用 `slides` 匯出圖片，看有沒有文字超出版面或重疊。

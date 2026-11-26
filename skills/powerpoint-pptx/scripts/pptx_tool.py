@@ -4,10 +4,11 @@
   python pptx_tool.py read    簡報.pptx [-o 輸出.md]      （每頁文字、表格、備忘稿）
   python pptx_tool.py layouts 簡報或範本.pptx              （列出可用的版面配置與預留位置）
   python pptx_tool.py topdf   簡報.pptx [-o 輸出.pdf]      （需要 PowerPoint 或 LibreOffice）
+  python pptx_tool.py slides  簡報.pptx [-o 圖片資料夾]    （每頁輸出 PNG，用來檢查版面）
+  python pptx_tool.py office                              （列出 Office/LibreOffice 安裝位置，含 32/64 位元）
 """
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 
@@ -87,39 +88,24 @@ def cmd_layouts(a):
         print(f"[{i}] {layout.name}: {phs}")
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import office_convert  # noqa: E402  找 Office（32/64 位元）與轉檔
+
+
 def cmd_topdf(a):
     dst = a.output or os.path.splitext(a.file)[0] + ".pdf"
-    errors = []
-    if sys.platform == "win32":
-        try:
-            ensure("win32com", "pywin32")
-            import win32com.client
-            app = win32com.client.DispatchEx("PowerPoint.Application")
-            try:
-                pres = app.Presentations.Open(os.path.abspath(a.file), ReadOnly=True, WithWindow=False)
-                pres.SaveAs(os.path.abspath(dst), 32)  # 32 = PDF
-                pres.Close()
-            finally:
-                app.Quit()
-            print(f"已用 PowerPoint 轉成: {dst}")
-            return
-        except Exception as e:
-            errors.append(f"PowerPoint: {e}")
-    soffice = None
-    for c in ("soffice", r"C:\Program Files\LibreOffice\program\soffice.exe"):
-        if shutil.which(c) or os.path.exists(c):
-            soffice = shutil.which(c) or c
-            break
-    if soffice:
-        outdir = os.path.dirname(os.path.abspath(dst))
-        subprocess.check_call([soffice, "--headless", "--convert-to", "pdf", "--outdir", outdir, a.file])
-        produced = os.path.join(outdir, os.path.splitext(os.path.basename(a.file))[0] + ".pdf")
-        if os.path.abspath(produced) != os.path.abspath(dst):
-            shutil.move(produced, dst)
-        print(f"已用 LibreOffice 轉成: {dst}")
-        return
-    errors.append("LibreOffice: 找不到")
-    sys.exit("轉檔失敗：\n" + "\n".join(errors))
+    how = office_convert.to_pdf(a.file, dst)
+    print(f"已用 {how} 轉成: {os.path.abspath(dst)}")
+
+
+def cmd_slides(a):
+    files = office_convert.export_slides(a.file, a.output)
+    print(f"已輸出 {len(files)} 張圖到: {os.path.dirname(files[0]) if files else a.output}")
+    print("用 read 工具打開 PNG 檢查每一頁有沒有文字超出、重疊。")
+
+
+def cmd_office(a):
+    print(office_convert.describe())
 
 
 def main():
@@ -128,8 +114,13 @@ def main():
     s = sub.add_parser("read"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_read)
     s = sub.add_parser("layouts"); s.add_argument("file"); s.set_defaults(fn=cmd_layouts)
     s = sub.add_parser("topdf"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_topdf)
+    s = sub.add_parser("slides"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_slides)
+    s = sub.add_parser("office"); s.set_defaults(fn=cmd_office)
     a = p.parse_args()
-    a.fn(a)
+    try:
+        a.fn(a)
+    except Exception as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
