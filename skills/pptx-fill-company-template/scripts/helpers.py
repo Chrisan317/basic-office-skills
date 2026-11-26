@@ -568,6 +568,17 @@ def structure_check(src_pres, out_pres):
     global src
     msgs = []
     _, _, owner = _owners(src_pres, out_pres)
+    # 來源一頁變成好幾頁（table_pages 自動拆頁的標題有 (1/n)，那種由 table 的 WARN 處理）
+    for i in sorted({o for o in owner if o is not None}):
+        mine = [k for k, o in enumerate(owner) if o == i]
+        if len(mine) < 2:
+            continue
+        ttls = [(out_pres.slides[k].shapes.title.text_frame.text if out_pres.slides[k].shapes.title is not None else "")
+                for k in mine]
+        if any(re.search(r"\(\d+/\d+\)", t) for t in ttls):
+            continue
+        msgs.append(f"來源第 {i + 1} 頁變成輸出第 " + "、".join(str(k + 1) for k in mine) + " 頁："
+                    "來源一頁就做成一頁（表格旁的說明用 put_table 縮小表格、讓出側欄，或放副標）；真的放不下要先問使用者")
     keep, src = src, src_pres
     try:
         for k, sl in enumerate(out_pres.slides):
@@ -610,11 +621,16 @@ def _owners(src_pres, out_pres):
         best = [scores[ks[0]][:]]
         back = [[None] * n]
         for k in ks[1:]:
-            row, br, run, arg = [], [], -1, 0
+            row, br, run, arg = [], [], -1e9, 0
             for i in range(n):
+                # 停在同一個來源頁扣 0.5 分：分數相同時優先往下一頁走（例如兩頁格式一樣的來源）
+                stay = best[-1][i] - 0.5
+                if stay >= run:
+                    row.append(stay + scores[k][i]); br.append(i)
+                else:
+                    row.append(run + scores[k][i]); br.append(arg)
                 if best[-1][i] > run:
                     run, arg = best[-1][i], i
-                row.append(run + scores[k][i]); br.append(arg)
             best.append(row); back.append(br)
         i = max(range(n), key=lambda j: best[-1][j])
         for step in range(len(ks) - 1, -1, -1):
