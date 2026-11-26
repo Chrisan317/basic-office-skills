@@ -98,13 +98,58 @@ def cmd_topdf(a):
     print(f"已用 {how} 轉成: {os.path.abspath(dst)}")
 
 
+def overview_sheets(files, per=6, cols=2, tile_w=800):
+    """把每頁 PNG 合成總覽圖（預設一張 6 頁、左上角標頁碼），回傳總覽圖路徑 list。
+    看圖的張數少很多：有些平台一次對話讀太多張圖會拒絕請求。"""
+    from PIL import Image, ImageDraw
+    out = []
+    if not files:
+        return out
+    folder = os.path.dirname(files[0])
+    for f in os.listdir(folder):  # 清掉上次的總覽圖
+        if f.startswith("overview_") and f.endswith(".png"):
+            os.remove(os.path.join(folder, f))
+    for k in range(0, len(files), per):
+        group = files[k:k + per]
+        ims = [Image.open(f).convert("RGB") for f in group]
+        tile_h = round(tile_w * ims[0].height / ims[0].width)
+        rows = -(-len(ims) // cols)
+        gap = 12
+        sheet = Image.new("RGB", (cols * tile_w + (cols + 1) * gap, rows * tile_h + (rows + 1) * gap), (120, 120, 120))
+        d = ImageDraw.Draw(sheet)
+        for i, im in enumerate(ims):
+            x = gap + (i % cols) * (tile_w + gap)
+            y = gap + (i // cols) * (tile_h + gap)
+            sheet.paste(im.resize((tile_w, tile_h)), (x, y))
+            label = f"P{k + i + 1}"
+            d.rectangle([x, y, x + 16 + 11 * len(label), y + 26], fill=(200, 0, 0))
+            d.text((x + 8, y + 7), label, fill="white")
+        p = os.path.join(folder, f"overview_{k // per + 1:02d}.png")
+        sheet.save(p)
+        out.append(p)
+    return out
+
+
 def cmd_slides(a):
     rep = []
     files = office_convert.export_slides(a.file, a.output, report=rep)
     for r in rep[:-1]:
         print(f"（{r}）")
     print(f"已用 {rep[-1]} 輸出 {len(files)} 張圖到: {os.path.dirname(files[0]) if files else a.output}")
-    print("用 read 工具打開 PNG 檢查每一頁有沒有文字超出、重疊。")
+    sheets = []
+    if not a.no_overview:
+        try:
+            sheets = overview_sheets(files)
+        except Exception as e:
+            print(f"（總覽圖沒做成：{e}）")
+    if sheets:
+        print(f"總覽圖 {len(sheets)} 張（每張 6 頁，左上角紅底是頁碼）：")
+        for s_ in sheets:
+            print("  " + s_)
+        print("先用 read 看總覽圖找出有問題的頁面，只有需要看細節的頁面才打開單頁 slide_NNN.png。")
+        print("一次對話讀太多張圖，部分平台會拒絕請求（例如 content safety screening），單頁圖盡量少開。")
+    else:
+        print("用 read 工具打開 PNG 檢查每一頁有沒有文字超出、重疊。")
 
 
 def cmd_office(a):
@@ -117,7 +162,8 @@ def main():
     s = sub.add_parser("read"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_read)
     s = sub.add_parser("layouts"); s.add_argument("file"); s.set_defaults(fn=cmd_layouts)
     s = sub.add_parser("topdf"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_topdf)
-    s = sub.add_parser("slides"); s.add_argument("file"); s.add_argument("-o", "--output"); s.set_defaults(fn=cmd_slides)
+    s = sub.add_parser("slides"); s.add_argument("file"); s.add_argument("-o", "--output")
+    s.add_argument("--no-overview", action="store_true", help="不要產生總覽圖"); s.set_defaults(fn=cmd_slides)
     s = sub.add_parser("office"); s.set_defaults(fn=cmd_office)
     a = p.parse_args()
     try:

@@ -98,7 +98,11 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 6. **輸出圖片逐頁檢查**（見下），修正後再輸出一次，直到沒有 MISSING（或都說明過）、圖片看起來沒問題。
 
 ## 一定要看投影片長什麼樣子
-`python "PPT" slides 輸出.pptx` → 每頁 PNG，用 read 工具逐頁看。
+`python "PPT" slides 輸出.pptx` → 每頁一張 `slide_NNN.png`，另外合成**總覽圖** `overview_NN.png`（一張 6 頁，左上角紅底是頁碼）。
+- **先看總覽圖**（17 頁只要 3 張），找出可疑的頁面，只有需要看細節時才開單頁圖。
+- **整個對話的看圖張數越少越好（建議 10 張以內）**：圖片會一直留在對話裡、每次都重送。
+  有些平台累積十幾張圖後會拒絕請求（例如 NVIDIA 的 `input rejected by content safety screening`），之後同一個對話怎麼重試都會失敗，只能開新對話。
+- 修改後重新匯出，只看改過的那幾頁或新的總覽圖，不要每頁重看。
 這個指令會自動處理：依序試 pywin32 → PowerShell（Office 是 32 位元時先用 32 位元 PowerShell）→ LibreOffice，並印出用了哪一種。**不要自己猜 PowerPoint 的路徑。**
 
 都沒有時（沒有 PowerPoint 也沒有 LibreOffice）：
