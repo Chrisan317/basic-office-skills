@@ -23,11 +23,16 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
   - `content_area(slide)`：依投影片大小、標題、已填的副標，回傳可放內容的 (x, y, w, h)，16:9 / 4:3 都適用
   - **讀來源**（數值、文字一律用這些讀，不要手打、不要自己寫解析）：
     - `src_paras(頁)`：該頁所有文字框的文字，**一行一筆**、由上而下（同一個文字框裡的兩行會拆開）；`pos=True` 附位置
-    - `src_tables(頁)`：該頁**所有**表格（一頁常常不只一個）；`cell_lines(儲存格)` 讀儲存格段落
+    - `src_tables(頁)`：該頁**所有**表格（一頁常常不只一個）；`cell_lines(儲存格)` 讀儲存格文字，一行一筆（段落和 Shift+Enter 換行都會拆開）
+    - `run_color(run)`：文字顏色（`'FF0000'`、`'accent1'`、`'tx1'`…，沒設定是 None）。用顏色表示狀態（● 紅＝延期）時用
     - `src_chart(頁)`：圖表的**全部**數列（含組合圖的折線），直接 `column_chart(s, **src_chart(頁))`
-  - `save(輸出)`：刪掉範本範例頁、存檔，並**比對來源和輸出的文字**，印出 `MISSING 來源第 N 頁：…`（漏掉的字）和 `WARN`（可能溢出、解析錯誤）
+  - `save(輸出)`：刪掉範本範例頁、存檔，並自動檢查，印出：
+    - `MISSING 來源第 N 頁：…`：來源有、輸出沒有的字
+    - `WARN 第 N 頁：A 和 B 重疊`／`超出投影片`：文字疊到表格、其他文字、範本的圖案（例如結尾頁的 Thank You）
+    - `WARN 來源第 N 頁圖表…`：圖表數列少了、折線變長條、數值和來源不同（手打）
+    - `WARN table … 拆成 N 頁`、`overflow?`、`stat_cards…`、`card_grid…`
   - 基本元件：`box`（圓角卡片）、`txt`（文字框，會預估是否溢出）、`table`、`cell_set`、`style_header_row`、`zebra_body`、`set_border`、`fit`、`norm`、`src_table`、`walk_shapes`（會進入群組）、`bar_line_combo`
-  - **常用版型**（見下節）：`agenda`、`stat_cards`、`card_grid`、`table_pages`、`column_chart`、`progress_bar`
+  - **常用版型**（見下節）：`agenda`、`stat_cards`、`card_grid`、`table_pages`、`put_table`、`column_chart`、`progress_bar`
 - `extract_source.py`：把 md / txt / csv / xlsx / docx 轉成統一結構（章節 → 段落 / 條列 / 表格），不摘要、不編造。
 - `build_from_text.py`：非簡報來源的通用套版，可直接用，也可以複製後調整。
 - `check_bounds.py`：沒辦法輸出圖片時，用來估算有沒有東西超出投影片。
@@ -38,7 +43,8 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 | `agenda(s, ["項目1", "項目2", ...])` | 目錄頁：編號＋項目卡片，5 項內一列，更多兩列 |
 | `stat_cards(s, [("有效", 120, "筆"), ("到期", 35, "筆")], y=None)` | 一排數字卡片，回傳下緣 y（下一個元件從這裡往下排）。數值只放數字，一張卡片一個值 |
 | `card_grid(s, [("標題", ["項目", ("主文字", "灰色說明")]), ...], cols=2)` | 2×2 等格狀卡片；內容多時自動縮小字級 |
-| `table_pages("標題", rows, first=s, top=y, bold_last=True)` | 表格：自動挑字級、依換行估列高、分頁時各頁平均、多頁標題加 (1/n)；rows 的格子可以是字串或字串 list（多段落） |
+| `table_pages("標題", rows, first=s, top=y, bold_last=True, max_pages=1)` | 表格：自動挑字級、依換行估列高；rows 的格子可以是字串或字串 list（多段落）。**來源是一頁的表格一定加 `max_pages=1`**：會縮到最小 8pt、列高壓緊來放進一頁。不加時放不下會自動分頁（標題加 (1/n)） |
+| `put_table(s, rows, x, y, w, size=11)` | 把表格放在指定位置、不分頁，回傳 (table, 下緣 y)：一頁兩個表格、表格旁邊有側欄時用（側欄寬度先扣掉） |
 | `column_chart(s, 類別, [("數列", 值), ...], line=("合計", 值))` | 原生直條圖，可加折線（組合圖，多條用 list）；來源是圖表時用 `column_chart(s, **src_chart(頁))` |
 | `progress_bar(s, x, y, w, 75.5)` | 達成率進度條 |
 
@@ -55,7 +61,7 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 
 ## 來源是簡報（pptx）
 1. **把來源當資料讀**：
-   - `python "PPT" read 來源.pptx` 得到每頁文字、表格、備忘稿
+   - `python "PPT" read 來源.pptx -o _work/來源_內容.md` 得到每頁文字、表格、備忘稿（加 `-o` 放進 `_work`，不要放在來源檔旁邊）
    - 寫腳本時每頁先印出 `src_paras(頁)`、`src_tables(頁)` 看清楚有哪些東西，再決定版型。`src_paras(頁, pos=True)` 附位置，可以判斷哪個標籤配哪個值。
    - 圖表一律用 `src_chart(頁)`（自己讀 `chart.plots[0]` 會漏掉折線）；用顏色表示的狀態要讀 run 的顏色。
 2. **讀範本**：`python "PPT" layouts 範本.pptx` 看版面名稱、預留位置、尺寸。範本裡的範例頁通常只是示範或樣式說明，參考配色後由 `save()` 自動刪掉。
@@ -64,8 +70,9 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
    |---|---|
    | 封面 | `new_slide("cover", 標題)` + `set_subtitle(s, 講者)` + `set_subtitle(s, 日期, nth=1)` |
    | 目錄/大綱 | `agenda` |
-   | 幾個重點數字＋明細 | `stat_cards` 在上，`table_pages(first=s, top=下緣+0.3)` 在下 |
-   | 表格 | `table_pages`；來源只有一頁的總表就保留一頁（`sizes=(10, 9)` 小字） |
+   | 幾個重點數字＋明細 | `stat_cards` 在上，`table_pages(first=s, top=下緣+0.3, max_pages=1)` 在下 |
+   | 表格 | `table_pages(..., max_pages=1)`：來源一頁就保留一頁；8pt 還放不下時 save() 會警告，先問使用者要不要拆頁 |
+   | 一頁兩個表格、表格＋側欄 | `put_table` 放在指定位置（或 `table_pages(..., area=(x, y, w, h))`） |
    | 多個文字區塊、標籤＋內容（日期/講者、負責人/地點…） | `card_grid`，或兩欄小表格 |
    | 圖表 | `column_chart(s, **src_chart(頁))` |
    | 達成率 | `stat_cards` + `progress_bar` |
@@ -84,21 +91,29 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
    y = stat_cards(s, [("營收", "1,234", "萬"), ("達成率", "104", "%")])
    ts = src_tables(3)                               # 一頁可能有好幾個表格，每個都要放
    rows = lambda t: [[cell_lines(c) for c in r.cells] for r in t.rows]
-   table_pages("業績摘要", rows(ts[0]), first=s, top=y + 0.3, bold_last=True)
-   for t in ts[1:]:
-       table_pages("業績摘要（續）", rows(t))        # 其他表格放新頁（或自己排在同一頁）
+   x, _, w, _ = content_area(s)
+   tb, y2 = put_table(s, rows(ts[0]), x, y + 0.3, w, bold_last=True)
+   for t in ts[1:]:                                 # 同一頁的其他表格接著往下放
+       tb, y2 = put_table(s, rows(t), x, y2 + 0.3, w)
+   s = new_slide("content", "明細")
+   table_pages("明細", rows(src_tables(4)[0]), first=s, max_pages=1)   # 大表格，來源一頁就保留一頁
    s = new_slide("content", "趨勢")
    column_chart(s, **src_chart(4))                  # 來源第 4 頁的圖表，全部數列
    save("輸出.pptx")                                # 會印出 MISSING / WARN
    ```
 5. **處理 save() 印出的每一條**：
-   - `MISSING 來源第 N 頁：…` 是來源有、輸出沒有的字（常見：漏掉第二個表格、說明文字、季度數字）。補上，或在回報裡說明為什麼刻意省略（例如改寫成表格欄名、範本已經有的公司名、來源錯字）。
+   - `MISSING 來源第 N 頁：…` 是來源有、輸出沒有的字（常見：漏掉第二個表格、說明文字、季度數字）。補上，或在回報裡說明為什麼刻意省略。
+     **來源的錯字、裝飾字、範本已經有的字（結尾頁的 Thank you、公司名）不要硬加回去**，在回報裡說明就好。不要為了消掉 MISSING 在投影片上疊文字。
+   - `WARN … 重疊`、`超出投影片`：改位置或大小。總覽圖太小看不出來，**有這種警告的頁面要打開單頁圖確認**。
+   - `WARN 來源第 N 頁圖表…`：改用 `column_chart(s, **src_chart(N))`。
+   - `WARN table … 拆成 N 頁`：來源一頁的表格加 `max_pages=1`。
    - `WARN stat_cards 數值…不像單一數字`：把兩行當成一個值了，用 `src_paras()` 一行一行讀。
    - `WARN overflow?`、`card_grid 卡片…沒有內容`：版面或解析有問題，修好再存。
-6. **輸出圖片逐頁檢查**（見下），修正後再輸出一次，直到沒有 MISSING（或都說明過）、圖片看起來沒問題。
+6. **輸出圖片檢查**（見下），修正後再輸出一次，直到沒有 WARN、MISSING 都補上或說明過、圖片看起來沒問題。
+   save() 還有 WARN 時，**不可以**說「全部檢查通過」。
 
 ## 一定要看投影片長什麼樣子
-`python "PPT" slides 輸出.pptx` → 每頁一張 `slide_NNN.png`，另外合成**總覽圖** `overview_NN.png`（一張 6 頁，左上角紅底是頁碼）。
+`python "PPT" slides 輸出.pptx -o _work/out_png` → 每頁一張 `slide_NNN.png`，另外合成**總覽圖** `overview_NN.png`（一張 6 頁，左上角紅底是頁碼）。
 - **先看總覽圖**（17 頁只要 3 張），找出可疑的頁面，只有需要看細節時才開單頁圖。
 - **整個對話的看圖張數越少越好（建議 10 張以內）**：圖片會一直留在對話裡、每次都重送。
   有些平台累積十幾張圖後會拒絕請求（例如 NVIDIA 的 `input rejected by content safety screening`），之後同一個對話怎麼重試都會失敗，只能開新對話。
@@ -116,12 +131,12 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 - **模組別取名 `h`**：`import helpers as h` 之後，迴圈裡的 `for h, sb in ...`、`h = 高度` 會蓋掉模組，`h.CLOUD` 就變成錯誤。用 `import helpers as H`，或直接用 `BLUE`、`CLOUD`（`init()` 會更新它們）。
 - **主題色要看 init() 印出的結果**：如果主色看起來太淺或不像公司色，自己指定 `H.BLUE` 等，再往下做。
 - **空白儲存格預設 18pt**，會默默把每一列撐高（31 列的表格就這樣超出投影片）。每個段落都要有和表格字級相同的 `a:endParaRPr sz=...`（`cell_set` 已處理）。
-- 來源只有一頁總表，就保留一頁（小字、合併標題、照原本的側欄）。要拆頁先問使用者。
+- 來源只有一頁總表，就保留一頁：`table_pages(..., max_pages=1)`（小字、合併標題、照原本的側欄）。要拆頁先問使用者。
 - 組合圖：自己讀 `chart.plots[0]` 會漏掉 `LinePlot` 裡的數列。用 `src_chart()`，它也會跳過沒有值的隱藏數列。
 - 同一個文字框常有好幾行（「有效: 120筆」換行「到期: 35筆」）：用 `text_frame.text` 一次讀會黏在一起，用 `src_paras()`。
 - 預留位置會繼承置中對齊：副標用 `set_subtitle`（內容頁自動靠左），或給 `align=PP_ALIGN.LEFT`。
 - 不同範本的副標預留位置 idx 不同：用 `set_subtitle()`，不要寫死 idx。
-- 密集表格（20 列以上）要分頁，或用 9.5–10pt；`table_pages` 會依每格文字換行數估列高（中文字約 1 個字級寬、英數約 0.55）。
+- 密集表格（20 列以上）：來源一頁就用 `max_pages=1`（最小 8pt）；`table_pages` 會依每格文字換行數估列高（中文字約 1 個字級寬、英數約 0.55）。
 - `cell.merge()` 會把被合併儲存格的文字串起來：合併前先清空非起點儲存格。
 - 表格樣式：tableStyleId 設 `{2D5ABB26-0587-4C30-8999-92F81FD0307C}`（No Style, No Grid），儲存格自己填色；框線放在 `tcPr` 的填色元素之前（`table`、`set_border` 已處理）。
 - 怪的來源結構整理成乾淨的（例如一個標題跨 3 個子欄，合成一欄）；兩行的標題放在同一格的兩個段落。

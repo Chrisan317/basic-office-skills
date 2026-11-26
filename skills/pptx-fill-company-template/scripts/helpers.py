@@ -178,18 +178,157 @@ def save(out_path, check=True):
         prs.slides._sldIdLst.remove(sid)
     prs.save(out_path)
     print("saved", out_path, "slides:", len(prs.slides))
-    for w_ in warn: print("WARN", w_)
+    msgs = list(warn)
+    if check:
+        msgs += overlap_check(prs)
+        if src is not None:
+            msgs += chart_check(src, prs)
+    for w_ in msgs: print("WARN", w_)
     if check and src is not None:
         miss = missing_text(src, prs)
         if miss:
             n = sum(len(v) for v in miss.values())
-            print(f"MISSING 來源有、輸出沒有的文字共 {n} 處（漏掉的表格、條列、數字）。"
-                  "逐條補上；確定是刻意省略的（例如範本已有的公司名、頁碼）要在回報裡說明：")
+            print(f"MISSING 來源有、輸出沒有的文字共 {n} 處（漏掉的表格、條列、數字）。逐條補上。\n"
+                  "  例外：來源的錯字、裝飾字、範本已經有的字（例如結尾頁的 Thank you、公司名）不要硬加回去，"
+                  "在回報裡說明即可。**不要為了消掉 MISSING 在投影片上疊文字。**")
             for no, toks in miss.items():
                 more = f" …等 {len(toks)} 處" if len(toks) > 15 else ""
                 print(f"  來源第 {no} 頁：" + "、".join(toks[:15]) + more)
         else:
             print("文字比對：來源的文字都有出現在輸出裡")
+    if msgs:
+        print(f"共 {len(msgs)} 則 WARN：重疊、超出、拆頁、圖表數列不符都要修好再存；看總覽圖看不出來時打開那一頁的單頁圖確認。")
+
+
+# ---------- 存檔時的自動檢查 ----------
+EMU = 914400
+
+
+def _text_rect(sh_):
+    """估計文字實際佔的範圍 (左, 上, 右, 下)（吋）：文字比框小時用文字大小，文字溢出時往下延伸。"""
+    l, t = (sh_.left or 0) / EMU, (sh_.top or 0) / EMU
+    w, h = (sh_.width or 0) / EMU, (sh_.height or 0) / EMU
+    tf = sh_.text_frame
+    ml = (tf.margin_left if tf.margin_left is not None else 91440) / EMU
+    mr = (tf.margin_right if tf.margin_right is not None else 91440) / EMU
+    inner = max(w - ml - mr, 0.2)
+    maxw, est, align = 0.0, 0.0, None
+    for p in tf.paragraphs:
+        # 每個 run 字級可能不同（大數字＋小單位）：逐 run 算寬度，遇到手動換行另起一行
+        segs, cur, big = [], 0.0, 0
+        for r in p.runs:
+            sz = r.font.size.pt if r.font.size else 18
+            big = max(big, sz)
+            parts = r.text.replace("\x0b", "\n").split("\n")
+            for k, part in enumerate(parts):
+                if k:
+                    segs.append(cur); cur = 0.0
+                cur += text_w(part, sz) / 72
+        segs.append(cur)
+        big = big or 18
+        for sw in segs:
+            maxw = max(maxw, min(sw, inner))
+            est += max(1, math.ceil(sw * 1.08 / inner)) * big * 1.25 / 72
+        est += p.space_after.pt / 72 if p.space_after else 0
+        align = align or p.alignment
+    est += 0.1
+    tw = min(w, maxw + ml + mr)
+    if align == PP_ALIGN.CENTER:
+        l += (w - tw) / 2
+    elif align == PP_ALIGN.RIGHT:
+        l += w - tw
+    if sh_.is_placeholder:  # 預留位置的垂直對齊是繼承的，用框的高度
+        return (l, t, l + tw, t + h)
+    anchor = tf.vertical_anchor
+    if anchor == MSO_ANCHOR.MIDDLE and est < h:
+        t += (h - est) / 2
+    elif anchor == MSO_ANCHOR.BOTTOM and est < h:
+        t += h - est
+    return (l, t, l + tw, t + max(est, 0.2) if est > h or anchor in (None, MSO_ANCHOR.TOP) else t + est)
+
+
+def _items(shapes, from_layout=False, slide_area=None):
+    out = []
+    for sh_ in walk_shapes(shapes):
+        if from_layout and sh_.is_placeholder:
+            continue
+        if sh_.is_placeholder and sh_.placeholder_format.type in _SKIP_PH:
+            continue
+        box_ = ((sh_.left or 0) / EMU, (sh_.top or 0) / EMU,
+                ((sh_.left or 0) + (sh_.width or 0)) / EMU, ((sh_.top or 0) + (sh_.height or 0)) / EMU)
+        if slide_area and (box_[2] - box_[0]) * (box_[3] - box_[1]) > slide_area * 0.4:
+            continue  # 背景圖
+        if getattr(sh_, "has_table", False) and sh_.has_table:
+            out.append(("表格", box_, from_layout))
+        elif getattr(sh_, "has_chart", False) and sh_.has_chart:
+            out.append(("圖表", box_, from_layout))
+        elif sh_.shape_type == 13:  # picture
+            out.append(("範本圖片" if from_layout else "圖片", box_, from_layout))
+        elif sh_.has_text_frame and sh_.text_frame.text.strip():
+            label = norm(sh_.text_frame.text)[:14]
+            out.append((("範本文字「%s」" if from_layout else "「%s」") % label, _text_rect(sh_), from_layout))
+    return out
+
+
+def overlap_check(pres):
+    """找出文字和表格／圖表／其他文字／範本圖案重疊、或超出投影片的地方，回傳警告 list。
+    （卡片底色這類沒有文字的圖形不算。）"""
+    W, H = pres.slide_width / EMU, pres.slide_height / EMU
+    msgs = []
+    for no, sl in enumerate(pres.slides, 1):
+        its = _items(sl.shapes)
+        its += _items(sl.slide_layout.shapes, True, W * H)
+        for name, (l, t, r, b), tpl in its:
+            if not tpl and (r > W + 0.05 or b > H + 0.05 or l < -0.05 or t < -0.05):
+                msgs.append(f"第 {no} 頁：{name} 超出投影片（右 {r:.2f}/{W:.2f}、下 {b:.2f}/{H:.2f}）")
+        for i in range(len(its)):
+            for j in range(i + 1, len(its)):
+                (n1, a, t1), (n2, b_, t2) = its[i], its[j]
+                if t1 and t2:
+                    continue
+                ow = min(a[2], b_[2]) - max(a[0], b_[0])
+                oh = min(a[3], b_[3]) - max(a[1], b_[1])
+                if ow > 0.12 and oh > 0.1:
+                    msgs.append(f"第 {no} 頁：{n1} 和 {n2} 重疊")
+    return msgs
+
+
+def _charts(pres):
+    out = []
+    for no, sl in enumerate(pres.slides, 1):
+        for sh_ in walk_shapes(sl.shapes):
+            if getattr(sh_, "has_chart", False) and sh_.has_chart:
+                ser = {}
+                for pl in sh_.chart.plots:
+                    kind = "折線" if "Line" in type(pl).__name__ else "長條"
+                    for se in pl.series:
+                        vals = list(se.values)
+                        if vals and any(v is not None for v in vals):
+                            ser[re.sub(r"\s+", "", se.name or "")] = (kind, [round(v or 0, 6) for v in vals])
+                out.append((no, ser))
+    return out
+
+
+def chart_check(src_pres, out_pres):
+    """比對來源圖表和輸出圖表：數列有沒有少、折線有沒有變成長條、數值是否一樣。"""
+    outs = _charts(out_pres)
+    msgs = []
+    for no, ser in _charts(src_pres):
+        if not ser:
+            continue
+        best = max(outs, key=lambda o: len(set(o[1]) & set(ser)), default=None)
+        if best is None or not set(best[1]) & set(ser):
+            msgs.append(f"來源第 {no} 頁的圖表沒有重建（輸出找不到同名數列）：用 column_chart(s, **src_chart({no}))")
+            continue
+        for nm, (kind, vals) in ser.items():
+            got = best[1].get(nm)
+            if got is None:
+                msgs.append(f"來源第 {no} 頁圖表的數列「{nm}」不見了（輸出第 {best[0]} 頁）")
+            elif got[0] != kind:
+                msgs.append(f"來源第 {no} 頁圖表的「{nm}」原本是{kind}，輸出變成{got[0]}：用 src_chart() 的 line")
+            elif got[1] != vals:
+                msgs.append(f"來源第 {no} 頁圖表的「{nm}」數值和來源不同：數值要用 src_chart() 讀，不要手打")
+    return msgs
 
 
 # ---------- 讀來源（數值、文字一律用程式讀，不要手打） ----------
@@ -493,7 +632,13 @@ def src_table(slide_no, nth=0):
     ts = [sh for sh in src.slides[slide_no - 1].shapes if sh.has_table]
     return ts[nth].table
 def cell_lines(c):
-    return [norm(p.text) for p in c.text_frame.paragraphs if norm(p.text)]
+    """儲存格的文字，一行一筆：段落和段落內的手動換行（Shift+Enter）都會拆開。"""
+    out = []
+    for p in c.text_frame.paragraphs:
+        for part in p.text.replace("\x0b", "\n").split("\n"):
+            if norm(part):
+                out.append(norm(part))
+    return out
 
 def style_header_row(t, r, labels, size, aligns=None, fill=None):
     for ci, lb in enumerate(labels):
@@ -564,13 +709,13 @@ def lines_needed(text, size, w_in):
     return n
 
 
-def row_height(cells, widths, size, min_h=0.3, pad=0.1):
+def row_height(cells, widths, size, min_h=0.3, pad=0.1, line=LINE):
     """表格一列需要的高度（吋）。cells 的每格可以是字串或字串 list（多個段落）。"""
     n = 1
     for v, w in zip(cells, widths):
         parts = v if isinstance(v, list) else [v]
         n = max(n, sum(lines_needed(p, size, w - 0.14) for p in parts) if parts else 1)
-    return max(min_h, n * size * LINE / 72 + pad)
+    return max(min_h, n * size * line / 72 + pad)
 
 
 def col_widths(rows, size, total, min_w=0.6, max_w=5.0):
@@ -616,40 +761,59 @@ def is_num(t):
 
 
 def table_pages(title, rows, first=None, top=None, sizes=(16, 14, 12, 11, 10), widths=None,
-                bold_last=False, aligns=None, layout="content", name="資料表", fill_ratio=0.55):
+                bold_last=False, aligns=None, layout="content", name="資料表", fill_ratio=0.55,
+                max_pages=None, area=None):
     """把表格（rows[0] 是表頭）放進一頁或多頁內容頁，回傳用到的投影片 list。
     - 自動挑字級：在「頁數最少」的前提下用最大的字級（小表格會放大，不會縮在左上角）。
     - 依每列文字的換行數估列高，分頁時讓各頁一樣高；多頁時標題加 (1/n)。
+    - max_pages=1：**來源只有一頁的表格用這個**。放不下時會再縮小字級（最小 8pt）、
+      把列高壓緊；還是放不下才分頁並發出警告。沒給 max_pages 而表格被拆頁時也會警告。
     - first：已建立的投影片當第一頁（上方已放說明文字時，用 top 指定表格起點 y）。
+    - area=(x, y, w, h)：只用第一頁的這個範圍（例如右邊要留側欄），不會自動分頁到別頁以外的區域。
     - aligns：{欄: PP_ALIGN}；沒給時數字欄置中。bold_last：最後一列（合計）粗體＋淺底。"""
     ncol = max(len(r) for r in rows)
     rows = [(list(r) + [""] * ncol)[:ncol] for r in rows]
     head, body = rows[0], rows[1:]
     s0 = first or new_slide(layout, title)
-    x, y, cw, ch = content_area(s0)
+    x, y, cw, ch = area or content_area(s0)
     y1 = top if top is not None else y
     avail1, avail = ch - (y1 - y), ch
+
+    def plan(size, compact):
+        w = widths or col_widths(rows, size, cw)
+        # compact：儲存格上下邊界 0.01 吋、行高用 1.2 倍（PowerPoint 小字的實際行高）
+        pad, ln = (0.02, 1.2) if compact else (0.1, LINE)
+        min_h = size * ln / 72 + (0.02 if compact else 0.12)
+        hh = row_height(head, w, size, min_h, pad, ln) + (0 if compact else 0.04)
+        bh = [row_height(r, w, size, min_h, pad, ln) for r in body]
+        pages = paginate(bh, [avail1 - hh, avail - hh])
+        return (len(pages), size, w, hh, bh, pages, compact)
+
+    tries = [(sz, False) for sz in sorted(sizes, reverse=True)]
+    if max_pages:
+        small = sorted({sz for sz in (10, 9, 8.5, 8) if sz <= min(sizes)} | set(sizes), reverse=True)
+        tries += [(sz, True) for sz in small]
     best = None
-    for size in sorted(sizes, reverse=True):
-        w = widths or col_widths(rows, size, cw)
-        min_h = size * LINE / 72 + 0.12
-        hh = row_height(head, w, size, min_h) + 0.04
-        bh = [row_height(r, w, size, min_h) for r in body]
-        pages = paginate(bh, [avail1 - hh, avail - hh])
-        cand = (len(pages), size, w, hh, bh, pages)
-        if best is None or len(pages) < best[0]:
+    for size, compact in tries:
+        cand = plan(size, compact)
+        if best is None or cand[0] < best[0]:
             best = cand
-    npg = best[0]
-    for size in sorted(sizes, reverse=True):  # 同樣頁數下用最大字級
-        w = widths or col_widths(rows, size, cw)
-        min_h = size * LINE / 72 + 0.12
-        hh = row_height(head, w, size, min_h) + 0.04
-        bh = [row_height(r, w, size, min_h) for r in body]
-        pages = paginate(bh, [avail1 - hh, avail - hh])
-        if len(pages) == npg:
-            best = (npg, size, w, hh, bh, pages)
+        if max_pages and cand[0] <= max_pages:
+            best = cand
             break
-    _, size, w, hh, bh, pages = best
+    if not max_pages:
+        npg = best[0]
+        for size in sorted(sizes, reverse=True):  # 同樣頁數下用最大字級
+            cand = plan(size, False)
+            if cand[0] == npg:
+                best = cand
+                break
+    _, size, w, hh, bh, pages, compact = best
+    if len(pages) > (max_pages or 1):
+        warn.append(f"table '{title}' 拆成 {len(pages)} 頁（{size}pt）。來源只有一頁的表格要用 max_pages=1；"
+                    "8pt 還放不下時先問使用者要不要拆頁")
+    elif max_pages and size < 10:
+        print(f"table_pages '{title}'：為了放進 {max_pages} 頁用 {size}pt，請在回報裡請使用者確認字是否太小")
     if aligns is None:
         aligns = {c: C for c in range(ncol) if c > 0 and all(is_num(r[c]) for r in body if r[c])}
     slides = []
@@ -673,8 +837,51 @@ def table_pages(title, rows, first=None, top=None, sizes=(16, 14, 12, 11, 10), w
         style_header_row(t, 0, head, size)
         part = [body[i] for i in idx]
         zebra_body(t, 1, part, size, aligns, bold_last=bold_last and pi == len(pages) - 1)
+        if compact:
+            for r_ in t.rows:
+                for c_ in r_.cells:
+                    c_.margin_top = c_.margin_bottom = Inches(0.01)
         slides.append(s)
     return slides
+
+
+def put_table(s, rows, x, y, w, size=11, widths=None, aligns=None, bold_last=False, header=True,
+              compact=True, name="資料表"):
+    """把一個表格放在指定位置（不分頁）：一頁放兩個表格、表格旁邊要留側欄時用。
+    rows[0] 是表頭（header=False 時全部當內容）；格子可以是字串或字串 list（多段落）。
+    回傳 (table, 下緣 y)，下一個元件從下緣往下排。超出投影片底部會在 save() 時警告。"""
+    ncol = max(len(r) for r in rows)
+    rows = [(list(r) + [""] * ncol)[:ncol] for r in rows]
+    w_ = widths and fit(widths, w) or col_widths(rows, size, w)
+    pad = 0.04 if compact else 0.1
+    min_h = size * LINE / 72 + (0.05 if compact else 0.12)
+    hs = [row_height(r, w_, size, min_h, pad) for r in rows]
+    body = rows[1:] if header else rows
+    if aligns is None:
+        aligns = {c: C for c in range(ncol) if c > 0 and body and all(is_num(r[c]) for r in body if r[c])}
+    t = table(s, x, y, w_, len(rows), hs, name=name)
+    if header:
+        style_header_row(t, 0, rows[0], size)
+    zebra_body(t, 1 if header else 0, body, size, aligns, bold_last=bold_last)
+    bottom = y + sum(hs)
+    if bottom > slide_size()[1] - 0.2:
+        warn.append(f"put_table '{name}' 下緣 {bottom:.2f} 超出投影片（高 {slide_size()[1]:.2f}）")
+    return t, bottom
+
+
+def run_color(run):
+    """讀文字顏色（用顏色表示狀態時用）：回傳 'FF0000' 這種 hex、'accent1'/'tx1'/'bg1' 這種主題色名稱
+    （有調亮暗時加上 '+lumMod75000' 之類），沒設定顏色時回傳 None。不會因為主題色而出錯。"""
+    rPr = run._r.find(qn("a:rPr"))
+    if rPr is None:
+        return None
+    fill = rPr.find(qn("a:solidFill"))
+    if fill is None or len(fill) == 0:
+        return None
+    clr = fill[0]
+    val = clr.get("val")
+    mods = "".join(f"+{etree.QName(m).localname}{m.get('val')}" for m in clr)
+    return (val.upper() if etree.QName(clr).localname == "srgbClr" else val) + mods
 
 
 def stat_cards(s, items, x=None, y=None, w=None, h=1.4, gap=0.25, value_size=36):

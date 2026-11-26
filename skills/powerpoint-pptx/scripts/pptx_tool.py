@@ -75,6 +75,7 @@ def cmd_read(a):
             notes = slide.notes_slide.notes_text_frame.text.strip()
             if notes:
                 lines.append(f"\n> 備忘稿：{notes}")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"已輸出: {out}")
