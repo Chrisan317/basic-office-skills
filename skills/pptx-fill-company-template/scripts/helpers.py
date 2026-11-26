@@ -193,6 +193,7 @@ def save(out_path, check=True):
         if src is not None:
             msgs += chart_check(src, prs)
             msgs += moved_text(src, prs)
+            msgs += structure_check(src, prs)
     for w_ in msgs: print("WARN", w_)
     if check and src is not None:
         miss = missing_text(src, prs)
@@ -375,6 +376,99 @@ def src_paras(slide_no, pos=False):
     return rows if pos else [t for _, _, t in rows]
 
 
+def _abs_boxes(shapes, tf=(0.0, 0.0, 1.0, 1.0)):
+    """所有有文字的形狀（含群組裡的），回傳 (shape, 左, 上, 寬, 高) 吋，群組內的座標換算成投影片座標。"""
+    ox, oy, sx, sy = tf
+    for sh_ in shapes:
+        l, t = (sh_.left or 0) / EMU, (sh_.top or 0) / EMU
+        w, h = (sh_.width or 0) / EMU, (sh_.height or 0) / EMU
+        L_, T_, W_, H_ = ox + l * sx, oy + t * sy, w * sx, h * sy
+        if sh_.shape_type == 6:
+            x = sh_._element.find(".//" + qn("a:chOff")); e = sh_._element.find(".//" + qn("a:chExt"))
+            cx, cy = (int(x.get("x")) / EMU, int(x.get("y")) / EMU) if x is not None else (0, 0)
+            cw, ch = (int(e.get("cx")) / EMU, int(e.get("cy")) / EMU) if e is not None else (w, h)
+            nsx, nsy = (W_ / cw if cw else sx), (H_ / ch if ch else sy)
+            yield from _abs_boxes(sh_.shapes, (L_ - cx * nsx, T_ - cy * nsy, nsx, nsy))
+        elif sh_.has_text_frame:
+            yield sh_, L_, T_, W_, H_
+
+
+def _lines(sh_):
+    return [norm(x) for p in sh_.text_frame.paragraphs for x in p.text.replace("\x0b", "\n").split("\n") if x.strip()]
+
+
+def src_title(slide_no):
+    """來源頁的標題文字 list（標題預留位置，和最上方 0.6 吋內的單行字，例如章節名、頁標題）。
+    這些字放進 new_slide 的標題就好，不要再放進內文。"""
+    boxes = [(sh_, l, t, w, h, _lines(sh_)) for sh_, l, t, w, h in _abs_boxes(src.slides[slide_no - 1].shapes)]
+    boxes = [b for b in boxes if b[5]]
+    def size(sh_):
+        ss = [r.font.size.pt for p in sh_.text_frame.paragraphs for r in p.runs if r.font.size]
+        return max(ss) if ss else 0
+    cand = [b for b in boxes if b[2] < 0.6 and len(b[5]) == 1]
+    out = []
+    for sh_, l, t, w, h, ln in boxes:
+        ph = sh_.is_placeholder and sh_.placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
+        if ph:
+            out.append((999, " ".join(ln)))
+        elif t < 0.6 and len(ln) == 1:
+            # 下方 1.2 吋內、左右重疊的地方有內文的，是小標（例如「第一期」），不是頁標題
+            below = any(b[0] is not sh_ and b not in cand and 0 < b[2] - t <= 1.2
+                        and min(l + w, b[1] + b[3]) - max(l, b[1]) > 0.1 for b in boxes)
+            if not below:
+                out.append((size(sh_), ln[0]))
+    out.sort(key=lambda x: -x[0])  # 字最大的排第一個
+    return [t for _, t in out]
+
+
+def src_cards(slide_no):
+    """把來源頁散放的文字框，依位置分成 [(小標, [內容行...]), ...]，可以直接 card_grid(s, src_cards(N))。
+    小標＝短的單行（或兩行）文字框，內容＝它下方、左右重疊的文字框。依「上→下、同一列左→右」排序。
+    沒有小標的內容，小標是 ""；只有小標沒有內容的，內容是 []。標題（src_title）不包含在內。
+    適合：並排的卡片、左右兩欄、「日期＋說明」這類來源頁。不要把整頁 src_paras() 倒成一串清單。"""
+    titles = set(src_title(slide_no))
+    heads, bodies = [], []
+    for sh_, l, t, w, h in _abs_boxes(src.slides[slide_no - 1].shapes):
+        if getattr(sh_, "has_table", False):
+            continue
+        ln = _lines(sh_)
+        if not ln or (len(ln) == 1 and ln[0] in titles and t < 0.6) or (
+                sh_.is_placeholder and sh_.placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)):
+            continue
+        rec = dict(l=l, t=t, r=l + w, b=t + h, lines=ln)
+        (heads if len(ln) <= 2 and sum(len(x) for x in ln) <= 20 and h <= 0.9 else bodies).append(rec)
+    # 只有一行的短字，如果正上方 1.2 吋內有另一個小標，是那個小標的內容（例如小標下的「無」）
+    heads.sort(key=lambda r: r["t"])
+    for hd in list(heads):
+        above = [o for o in heads if o is not hd and 0 < hd["t"] - o["t"] <= 1.2 and len(hd["lines"]) == 1
+                 and min(o["r"], hd["r"]) - max(o["l"], hd["l"]) > 0.1]
+        if above and not any(b["t"] > max(a["t"] for a in above) and b["t"] < hd["t"] for b in bodies):
+            heads.remove(hd); bodies.append(hd)
+    cards = [dict(head=hd, items=[]) for hd in heads]
+    orphans = []
+    for bd in sorted(bodies, key=lambda r: r["t"]):
+        best = None
+        for c in cards:
+            hd = c["head"]
+            if hd["t"] <= bd["t"] + 0.3 and min(hd["r"], bd["r"]) - max(hd["l"], bd["l"]) > -0.2:
+                d = bd["t"] - hd["t"]
+                if best is None or d < best[0]:
+                    best = (d, c)
+        if best:
+            best[1]["items"] += bd["lines"]
+        else:
+            orphans.append(dict(head=dict(l=bd["l"], t=bd["t"], lines=[]), items=bd["lines"]))
+    allc = cards + orphans
+    allc.sort(key=lambda c: c["head"]["t"])
+    rows = []
+    for c in allc:  # 上緣差 0.5 吋內算同一列
+        if rows and abs(c["head"]["t"] - rows[-1][0]["head"]["t"]) < 0.5:
+            rows[-1].append(c)
+        else:
+            rows.append([c])
+    return [(" ".join(c["head"]["lines"]), c["items"]) for r in rows for c in sorted(r, key=lambda c: c["head"]["l"])]
+
+
 def src_tables(slide_no):
     """來源第 slide_no 頁的**所有**表格（含群組裡的），依位置由上而下、由左而右。一頁常常不只一個表格。"""
     ts = [sh_ for sh_ in walk_shapes(src.slides[slide_no - 1].shapes)
@@ -443,6 +537,68 @@ def _toks(sl):
 def moved_text(src_pres, out_pres):
     """找出「來源某頁的字，只出現在對應別的來源頁的輸出頁」：通常是為了消 MISSING 把內容搬到別頁。
     每個輸出頁先找最像的來源頁（共同字最多），再看來源頁獨有的字有沒有跑到別頁。回傳訊息 list。"""
+    src_t, out_b, owner = _owners(src_pres, out_pres)
+    msgs = []
+    for i, ts in enumerate(src_t):
+        mine = [k for k, o in enumerate(owner) if o == i]
+        if not mine:
+            continue
+        others = set().union(*[set(t) for j, t in enumerate(src_t) if j != i]) if len(src_t) > 1 else set()
+        where = {}
+        for tok in ts:
+            if (tok.isascii() and len(tok) < 4) or tok in others or any(tok in out_b[k] for k in mine):
+                continue
+            for k, b in enumerate(out_b):
+                if tok in b:
+                    where.setdefault(k, []).append(tok)
+                    break
+        for k, toks in where.items():
+            o = owner[k]
+            pages = "、".join(str(m + 1) for m in mine)
+            msgs.append(f"來源第 {i + 1} 頁的字放到了輸出第 {k + 1} 頁（那頁對應來源第 {o + 1 if o is not None else '?'} 頁）："
+                        + "、".join(toks[:8]) + (f" …等 {len(toks)} 處" if len(toks) > 8 else "")
+                        + f"。要放回輸出第 {pages} 頁（版面不夠就縮小表格、用 put_table 讓出側欄），不要搬到別頁")
+    return msgs
+
+
+def structure_check(src_pres, out_pres):
+    """兩種「內容都在、但版面亂掉」的情況：
+    1. 來源是好幾個分開的區塊（小標＋內容），輸出卻變成一個文字框的一串清單 → 用 card_grid(s, src_cards(N))
+    2. 內文裡又出現一次標題（把 src_paras() 整頁倒進去時常見）"""
+    global src
+    msgs = []
+    _, _, owner = _owners(src_pres, out_pres)
+    keep, src = src, src_pres
+    try:
+        for k, sl in enumerate(out_pres.slides):
+            ttl = sl.shapes.title.text_frame.text.strip() if sl.shapes.title is not None else ""
+            boxes = [sh_ for sh_ in walk_shapes(sl.shapes) if sh_.has_text_frame and sh_.text_frame.text.strip()
+                     and not (sh_.is_placeholder and sh_.placeholder_format.type in
+                              (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, *_SKIP_PH))]
+            if ttl:
+                for sh_ in boxes:
+                    if sh_.name == "Subtitle" or (sh_.is_placeholder and sh_.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE):
+                        continue
+                    if any(norm(x) == norm(ttl) for x in _lines(sh_)):
+                        msgs.append(f"第 {k + 1} 頁：內文又出現一次標題「{ttl}」：來源的標題（src_title）放標題就好，從內文拿掉")
+                        break
+            o = owner[k]
+            other = [sh_ for sh_ in walk_shapes(sl.shapes)
+                     if getattr(sh_, "has_table", False) and sh_.has_table or getattr(sh_, "has_chart", False) and sh_.has_chart]
+            if o is None or other or len(boxes) > 1:
+                continue
+            cards = [c for c in src_cards(o + 1) if c[0] and c[1]]
+            if len(cards) >= 2:
+                msgs.append(f"第 {k + 1} 頁：來源第 {o + 1} 頁是 {len(cards)} 個分開的區塊（"
+                            + "、".join(c[0] for c in cards[:4]) + "），輸出變成一整串清單："
+                            "用 card_grid(s, src_cards(" + str(o + 1) + "), cols=...) 保留分區")
+    finally:
+        src = keep
+    return msgs
+
+
+def _owners(src_pres, out_pres):
+    """回傳 (每個來源頁的字, 每個輸出頁的文字, 每個輸出頁對應的來源頁 index 或 None)。"""
     src_t = [_toks(sl) for sl in src_pres.slides]
     out_b = [re.sub(r"\s+", "", "".join(t for _, _, t in _texts_of(sl.shapes))).lower() for sl in out_pres.slides]
     # 輸出頁照來源順序排：用動態規劃找「來源頁碼不倒退」且共同字總數最多的對應
@@ -465,27 +621,7 @@ def moved_text(src_pres, out_pres):
             owner[ks[step]] = i
             if step:
                 i = back[step][i]
-    msgs = []
-    for i, ts in enumerate(src_t):
-        mine = [k for k, o in enumerate(owner) if o == i]
-        if not mine:
-            continue
-        others = set().union(*[set(t) for j, t in enumerate(src_t) if j != i]) if len(src_t) > 1 else set()
-        where = {}
-        for tok in ts:
-            if (tok.isascii() and len(tok) < 4) or tok in others or any(tok in out_b[k] for k in mine):
-                continue
-            for k, b in enumerate(out_b):
-                if tok in b:
-                    where.setdefault(k, []).append(tok)
-                    break
-        for k, toks in where.items():
-            o = owner[k]
-            pages = "、".join(str(m + 1) for m in mine)
-            msgs.append(f"來源第 {i + 1} 頁的字放到了輸出第 {k + 1} 頁（那頁對應來源第 {o + 1 if o is not None else '?'} 頁）："
-                        + "、".join(toks[:8]) + (f" …等 {len(toks)} 處" if len(toks) > 8 else "")
-                        + f"。要放回輸出第 {pages} 頁（版面不夠就縮小表格、用 put_table 讓出側欄），不要搬到別頁")
-    return msgs
+    return src_t, out_b, owner
 
 # ---------- helpers ----------
 def is_cjk(ch): return ord(ch) > 0x2E80
@@ -1040,6 +1176,10 @@ def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None
             est_h([(p["text"], p["size"], p["after"]) for p in build(items, bs)], cw - 0.5) + 0.06 > ch - 0.75
             for _, items in cards):
         bs -= 1
+    # 內容少時卡片不要撐滿整頁：高度改成內容需要的高度（最少 1.6 吋）
+    need = max((est_h([(p["text"], p["size"], p["after"]) for p in build(items, bs)], cw - 0.5) for _, items in cards),
+               default=0) + 0.95
+    ch = min(ch, max(need, 1.6))
     for i, (ttl, items) in enumerate(cards):
         cx, cy = x + (i % cols) * (cw + gap), y + (i // cols) * (ch + gap)
         box(s, cx, cy, cw, ch, CLOUD)

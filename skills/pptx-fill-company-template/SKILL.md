@@ -24,7 +24,9 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
   - `set_subtitle(s, 文字, nth=0)`：填副標預留位置（封面常有兩個：nth=0 講者、nth=1 日期）。內容頁會自動把副標移到標題下方、靠左；版面沒有副標預留位置時，會在標題下方補一個文字框
   - `content_area(slide)`：依投影片大小、標題、已填的副標，回傳可放內容的 (x, y, w, h)，16:9 / 4:3 都適用
   - **讀來源**（數值、文字一律用這些讀，不要手打、不要自己寫解析）：
-    - `src_paras(頁)`：該頁所有文字框的文字，**一行一筆**、由上而下（同一個文字框裡的兩行會拆開）；`pos=True` 附位置
+    - `src_title(頁)`：來源頁的標題文字 list（字最大的在前），放進 `new_slide` 的標題，**不要再放進內文**
+    - `src_cards(頁)`：把散放的文字框依位置分組成 `[(小標, [內容行...]), ...]`（並排卡片、左右欄、日期＋說明），直接 `card_grid(s, src_cards(頁), cols=…)`
+    - `src_paras(頁)`：該頁所有文字框的文字，**一行一筆**、由上而下（同一個文字框裡的兩行會拆開）；`pos=True` 附位置。只用來看內容或抓數字，不要整串倒進一個文字框
     - `src_tables(頁)`：該頁**所有**表格（一頁常常不只一個）；`cell_lines(儲存格)` 讀儲存格文字，一行一筆（段落和 Shift+Enter 換行都會拆開）
     - `run_color(run)`：文字顏色（`'FF0000'`、`'accent1'`、`'tx1'`…，沒設定是 None）。用顏色表示狀態（● 紅＝延期）時用
     - `src_chart(頁)`：圖表的**全部**數列（含組合圖的折線），直接 `column_chart(s, **src_chart(頁))`
@@ -33,6 +35,7 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
     - `WARN 第 N 頁：A 和 B 重疊`／`超出投影片`：文字疊到表格、其他文字、範本的圖案（例如結尾頁的 Thank You）
     - `WARN 來源第 N 頁圖表…`：圖表數列少了、折線變長條、數值和來源不同（手打）
     - `WARN 來源第 N 頁的字放到了輸出第 M 頁`：內容被搬到別頁（例如把放不下的側欄塞到下一頁）
+    - `WARN 第 N 頁：來源…是 K 個分開的區塊，輸出變成一整串清單`、`內文又出現一次標題`：文字頁沒排版
     - `WARN table … 拆成 N 頁`、`overflow?`、`stat_cards…`、`card_grid…`
   - 基本元件：`box`（圓角卡片）、`txt`（文字框，會預估是否溢出）、`table`、`cell_set`、`style_header_row`、`zebra_body`、`set_border`、`fit`、`norm`、`src_table`、`walk_shapes`（會進入群組）、`bar_line_combo`
   - **常用版型**（見下節）：`agenda`、`stat_cards`、`card_grid`、`table_pages`、`put_table`、`column_chart`、`progress_bar`
@@ -65,7 +68,7 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 ## 來源是簡報（pptx）
 1. **把來源當資料讀**：
    - `python "PPT" read 來源.pptx -o _work/來源_內容.md` 得到每頁文字、表格、備忘稿（加 `-o` 放進 `_work`，不要放在來源檔旁邊）
-   - 寫腳本時每頁先印出 `src_paras(頁)`、`src_tables(頁)` 看清楚有哪些東西，再決定版型。`src_paras(頁, pos=True)` 附位置，可以判斷哪個標籤配哪個值。
+   - 寫腳本時每頁先印出 `src_title(頁)`、`src_cards(頁)`、`src_tables(頁)` 看清楚有哪些東西，再決定版型。`src_paras(頁, pos=True)` 附位置，可以判斷哪個標籤配哪個值。
    - 圖表一律用 `src_chart(頁)`（自己讀 `chart.plots[0]` 會漏掉折線）；用顏色表示的狀態要讀 run 的顏色。
 2. **讀範本**：`python "PPT" layouts 範本.pptx` 看版面名稱、預留位置、尺寸。範本裡的範例頁通常只是示範或樣式說明，參考配色後由 `save()` 自動刪掉。
 3. **每頁對應一個版型**：
@@ -76,7 +79,8 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
    | 幾個重點數字＋明細 | `stat_cards` 在上，`table_pages(first=s, top=下緣+0.3, max_pages=1)` 在下 |
    | 表格 | `table_pages(..., max_pages=1)`：來源一頁就保留一頁；8pt 還放不下時 save() 會警告，先問使用者要不要拆頁 |
    | 一頁兩個表格、表格＋側欄 | `put_table` 放在指定位置（或 `table_pages(..., area=(x, y, w, h))`） |
-   | 多個文字區塊、標籤＋內容（日期/講者、負責人/地點…） | `card_grid`，或兩欄小表格 |
+   | 多個文字區塊、標籤＋內容（日期/講者、負責人/地點、左右兩欄…） | `card_grid(s, src_cards(頁), cols=區塊數或 2)`；標題用 `src_title(頁)[0]` |
+   | 只有一段條列（沒有小標） | `card_grid(s, [("", src_cards(頁)[0][1])], cols=1)`，或 `txt`；條列不要包含標題 |
    | 圖表 | `column_chart(s, **src_chart(頁))` |
    | 達成率 | `stat_cards` + `progress_bar` |
    | 結尾 | `new_slide("closing")` |
@@ -102,6 +106,8 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
    table_pages("明細", rows(src_tables(4)[0]), first=s, max_pages=1)   # 大表格，來源一頁就保留一頁
    s = new_slide("content", "趨勢")
    column_chart(s, **src_chart(4))                  # 來源第 4 頁的圖表，全部數列
+   s = new_slide("content", src_title(5)[0])        # 文字頁：標題用來源的標題
+   card_grid(s, src_cards(5), cols=3)               # 並排的區塊 → 卡片（小標＋內容）
    save("輸出.pptx")                                # 會印出 MISSING / WARN
    ```
 5. **處理 save() 印出的每一條**：
@@ -109,6 +115,8 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
      **來源的錯字、裝飾字、範本已經有的字（結尾頁的 Thank you、公司名）不要硬加回去**，在回報裡說明就好。不要為了消掉 MISSING 在投影片上疊文字。
      **也不要把字搬到別頁**（例如把表格頁的標題、圖例、側欄塞到後面的統計頁）：每頁的內容要留在對應的那一頁。
    - `WARN 來源第 N 頁的字放到了輸出第 M 頁`：把那些字放回原本那頁。表格佔滿放不下側欄時，用 `put_table(s, rows, x, y, w)` 把表格寬度縮小（例如 8.3 吋），右邊放側欄；來源頁上的大標題放進標題，圖例放副標。
+   - `WARN 第 N 頁：來源…是 K 個分開的區塊，輸出變成一整串清單`：改成 `card_grid(s, src_cards(來源頁), cols=…)`。
+   - `WARN 第 N 頁：內文又出現一次標題`：內文用 `src_cards()`（不含標題），或從清單拿掉 `src_title()` 的字。
    - `WARN … 重疊`、`超出投影片`：改位置或大小。總覽圖太小看不出來，**有這種警告的頁面要打開單頁圖確認**。
    - `WARN 來源第 N 頁圖表…`：改用 `column_chart(s, **src_chart(N))`。
    - `WARN table … 拆成 N 頁`：來源一頁的表格加 `max_pages=1`。
