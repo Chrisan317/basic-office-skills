@@ -12,7 +12,7 @@ import re, math, copy, sys
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.shapes import MSO_SHAPE, PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.chart.data import CategoryChartData
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_LABEL_POSITION
@@ -170,14 +170,115 @@ def init(src_path, tpl_path, theme=True):
         pass
     return src, prs
 
-def save(out_path):
-    """Drop the template's sample slides, save, print warnings."""
+def save(out_path, check=True):
+    """Drop the template's sample slides, save, print warnings.
+    有來源簡報時（check=True）會比對文字，印出「來源有、輸出沒有」的字（MISSING），一定要逐條處理。"""
     for sid in orig_ids:
         prs.part.drop_rel(sid.rId)
         prs.slides._sldIdLst.remove(sid)
     prs.save(out_path)
     print("saved", out_path, "slides:", len(prs.slides))
     for w_ in warn: print("WARN", w_)
+    if check and src is not None:
+        miss = missing_text(src, prs)
+        if miss:
+            n = sum(len(v) for v in miss.values())
+            print(f"MISSING 來源有、輸出沒有的文字共 {n} 處（漏掉的表格、條列、數字）。"
+                  "逐條補上；確定是刻意省略的（例如範本已有的公司名、頁碼）要在回報裡說明：")
+            for no, toks in miss.items():
+                more = f" …等 {len(toks)} 處" if len(toks) > 15 else ""
+                print(f"  來源第 {no} 頁：" + "、".join(toks[:15]) + more)
+        else:
+            print("文字比對：來源的文字都有出現在輸出裡")
+
+
+# ---------- 讀來源（數值、文字一律用程式讀，不要手打） ----------
+_SKIP_PH = (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.DATE)
+
+
+def _texts_of(shapes, tables=True):
+    """依閱讀順序（上→下、左→右）回傳 (top, left, 文字) list；群組會進入，換行拆成多段。"""
+    out = []
+    for sh_ in walk_shapes(shapes):
+        if sh_.is_placeholder and sh_.placeholder_format.type in _SKIP_PH:
+            continue
+        top, left = (sh_.top or 0) / 914400, (sh_.left or 0) / 914400
+        if sh_.has_text_frame:
+            for p in sh_.text_frame.paragraphs:
+                for part in p.text.replace("\x0b", "\n").split("\n"):
+                    if part.strip():
+                        out.append((round(top, 2), round(left, 2), part.strip()))
+        elif tables and getattr(sh_, "has_table", False) and sh_.has_table:
+            for r in sh_.table.rows:
+                for c in r.cells:
+                    for part in c.text.replace("\x0b", "\n").split("\n"):
+                        if part.strip():
+                            out.append((round(top, 2), round(left, 2), part.strip()))
+    out.sort(key=lambda t: (t[0], t[1]))
+    return out
+
+
+def src_paras(slide_no, pos=False):
+    """來源第 slide_no 頁（從 1 起算）所有文字框的文字，一行一筆，依位置由上而下排。
+    同一個文字框裡的多行（例如「有效: 120筆」「到期: 35筆」）會拆開。
+    表格不含在內（用 src_tables）。pos=True 時回傳 (top吋, left吋, 文字)，可用位置判斷哪個標籤配哪個值。"""
+    rows = _texts_of(src.slides[slide_no - 1].shapes, tables=False)
+    return rows if pos else [t for _, _, t in rows]
+
+
+def src_tables(slide_no):
+    """來源第 slide_no 頁的**所有**表格（含群組裡的），依位置由上而下、由左而右。一頁常常不只一個表格。"""
+    ts = [sh_ for sh_ in walk_shapes(src.slides[slide_no - 1].shapes)
+          if getattr(sh_, "has_table", False) and sh_.has_table]
+    ts.sort(key=lambda t: ((t.top or 0), (t.left or 0)))
+    return [t.table for t in ts]
+
+
+def src_chart(slide_no, nth=0):
+    """讀來源圖表的**全部**數列（含組合圖的折線，跳過沒有值的隱藏數列），
+    回傳 dict(categories, bars, line)，可以直接 column_chart(s, **src_chart(12))。"""
+    chs = [sh_ for sh_ in walk_shapes(src.slides[slide_no - 1].shapes)
+           if getattr(sh_, "has_chart", False) and sh_.has_chart]
+    ch = chs[nth].chart
+    cats = [norm(str(c)) for c in ch.plots[0].categories]
+    bars, lines = [], []
+    for pl in ch.plots:
+        kind = type(pl).__name__
+        for se in pl.series:
+            vals = list(se.values)
+            if not vals or all(v is None for v in vals):
+                continue
+            item = (norm(se.name or ""), [v or 0 for v in vals])
+            (lines if "Line" in kind else bars).append(item)
+    if not bars and lines:  # 只有折線：第一條當長條
+        bars.append(lines.pop(0))
+    return dict(categories=cats, bars=bars, line=lines or None)
+
+
+_SEP = re.compile(r"[\s:：、,，;；/()（）\[\]【】「」\"'*~\-–—|•·●○■□◆◇★☆※✓✔→]+")
+_RUN = re.compile(r"[A-Za-z0-9.%&+#]+|[^\x00-\x7f]+")  # 中文和英數分開比，改寫成表格欄位也算有
+
+
+def _blob(pres):
+    return re.sub(r"\s+", "", "".join(t for sl in pres.slides for _, _, t in _texts_of(sl.shapes))).lower()
+
+
+def missing_text(src_pres, out_pres):
+    """回傳 {來源頁碼: [輸出裡找不到的字]}。比對時忽略空白和標點，所以拆成標籤＋數字也算有。"""
+    blob = _blob(out_pres)
+    miss = {}
+    for no, sl in enumerate(src_pres.slides, 1):
+        seen = []
+        for _, _, t in _texts_of(sl.shapes):
+            for tok in (x for part in _SEP.split(t) for x in _RUN.findall(part)):
+                tok = tok.strip(".。").lower()
+                if len(tok) < 2 and not tok.isdigit():
+                    continue
+                if tok not in blob and tok not in seen:
+                    seen.append(tok)
+        if seen:
+            miss[no] = seen
+    return miss
 
 # ---------- helpers ----------
 def is_cjk(ch): return ord(ch) > 0x2E80
@@ -435,6 +536,10 @@ def bar_line_combo(chart, line_series_index, color=None, labels=True):
         dl_ = etree.fromstring('<c:dLbls xmlns:c="%s" xmlns:a="%s"><c:numFmt formatCode="0" sourceLinked="0"/><c:spPr><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr><c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900" b="1"><a:solidFill><a:srgbClr val="%s"/></a:solidFill></a:defRPr></a:pPr><a:endParaRPr lang="zh-TW"/></a:p></c:txPr><c:dLblPos val="t"/><c:showLegendKey val="0"/><c:showVal val="1"/><c:showCatName val="0"/><c:showSerName val="0"/><c:showPercent val="0"/><c:showBubbleSize val="0"/></c:dLbls>' % (C_NS, A_NS, color))
         marker.addnext(dl_)
     etree.SubElement(tot, "{%s}smooth" % C_NS).set("val", "0")
+    nxt = bar.getnext()
+    if nxt is not None and nxt.tag == "{%s}lineChart" % C_NS:  # 已經有折線群組：加進去
+        nxt.find("{%s}marker" % C_NS).addprevious(tot)
+        return
     line = etree.Element("{%s}lineChart" % C_NS)
     etree.SubElement(line, "{%s}grouping" % C_NS).set("val", "standard")
     etree.SubElement(line, "{%s}varyColors" % C_NS).set("val", "0")
@@ -583,6 +688,12 @@ def stat_cards(s, items, x=None, y=None, w=None, h=1.4, gap=0.25, value_size=36)
     cw = (w - gap * (n - 1)) / n
     for i, it in enumerate(items):
         lab, val, unit = (list(it) + ["", ""])[:3]
+        val, unit = str(val).strip(), str(unit or "").strip()
+        if unit and val.endswith(unit):  # 「120筆」＋單位「筆」→ 不要變成「120筆 筆」
+            val = val[: -len(unit)].strip()
+        if re.search(r"[\n\x0b]", val) or len(val) > 10 or not re.search(r"\d", val):
+            warn.append(f"stat_cards 數值「{norm(val)[:20]}」不像單一數字（有換行、太長或沒有數字），"
+                        "可能把兩行解析成一個值：用 src_paras() 一行一行讀")
         cx = x + i * (cw + gap)
         box(s, cx, y, cw, h, CLOUD)
         txt(s, cx + 0.15, y + 0.08, cw - 0.3, 0.4, [dict(text=str(lab), size=14, color=GRAY)])
@@ -624,22 +735,35 @@ def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None
     rws = math.ceil(n / cols)
     cw, ch = (w - gap * (cols - 1)) / cols, (hh - gap * (rws - 1)) / rws
     out = []
-    for i, (ttl, items) in enumerate(cards):
-        cx, cy = x + (i % cols) * (cw + gap), y + (i // cols) * (ch + gap)
-        box(s, cx, cy, cw, ch, CLOUD)
-        txt(s, cx + 0.2, cy + 0.12, cw - 0.4, 0.45, [dict(text=ttl, size=title_size, bold=True, color=BLUE)])
+    def build(items, bs):
         paras = []
         for it in items:
             if isinstance(it, (tuple, list)):
                 main, sub = (list(it) + [""])[:2]
-                paras.append(dict(text=main, size=body_size, bold=True, color=BLACK, after=0 if sub else 4))
+                paras.append(dict(text=str(main), size=bs, bold=True, color=BLACK, after=0 if sub else 4))
                 if sub:
-                    paras.append(dict(text=sub, size=body_size - 2, color=GRAY, after=6))
+                    paras.append(dict(text=str(sub), size=bs - 2, color=GRAY, after=6))
             else:
-                paras.append(dict(text=it, size=body_size, color=BLACK, after=6))
+                paras.append(dict(text=str(it), size=bs, color=BLACK, after=6))
+        return paras
+    # 字級：所有卡片用同一個字級，放不下就縮小（最小 10pt），還是放不下 txt 會發出 overflow 警告
+    bs = body_size
+    while bs > 10 and any(
+            est_h([(p["text"], p["size"], p["after"]) for p in build(items, bs)], cw - 0.5) + 0.06 > ch - 0.75
+            for _, items in cards):
+        bs -= 1
+    for i, (ttl, items) in enumerate(cards):
+        cx, cy = x + (i % cols) * (cw + gap), y + (i // cols) * (ch + gap)
+        box(s, cx, cy, cw, ch, CLOUD)
+        txt(s, cx + 0.2, cy + 0.12, cw - 0.4, 0.45, [dict(text=ttl, size=title_size, bold=True, color=BLUE)])
+        paras = build(items, bs)
         if paras:
             txt(s, cx + 0.2, cy + 0.65, cw - 0.4, ch - 0.75, paras)
+        else:
+            warn.append(f"card_grid 卡片「{ttl}」沒有內容：檢查解析程式")
         out.append((cx, cy, cw, ch))
+    if bs < body_size:
+        print(f"card_grid：內容較多，內文縮到 {bs}pt")
     return out
 
 
@@ -652,7 +776,11 @@ def progress_bar(s, x, y, w, pct, h=0.14, track=None, color=None):
 
 def column_chart(s, categories, bars, line=None, area=None, colors=None, labels=True, name="圖表"):
     """原生直條圖（可加一條折線，例如合計）。
-    bars：[(數列名稱, 數值 list), ...]；line：(名稱, 數值 list) 或 None。回傳 chart。"""
+    bars：[(數列名稱, 數值 list), ...]；line：(名稱, 數值 list)、多條時用 list，或 None。回傳 chart。
+    來源是圖表時直接 column_chart(s, **src_chart(頁碼))，不會漏掉組合圖的折線。"""
+    if line and isinstance(line[0], str):
+        line = [line]
+    line = list(line or [])
     x, y, w, hh = area or content_area(s)
     cd = CategoryChartData()
     cd.categories = [str(c) for c in categories]
@@ -660,12 +788,12 @@ def column_chart(s, categories, bars, line=None, area=None, colors=None, labels=
     for nm, vals in bars:
         v = [float(a or 0) for a in vals]; allv += v
         cd.add_series(nm, v)
-    if line:
-        cd.add_series(line[0], [float(a or 0) for a in line[1]])
+    for nm, vals in line:
+        cd.add_series(nm, [float(a or 0) for a in vals])
     gf = s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(x), Inches(y), Inches(w), Inches(hh), cd)
     gf.name = name
     ch = gf.chart
-    nser = len(bars) + (1 if line else 0)
+    nser = len(bars) + len(line)
     ch.has_legend = nser > 1
     if ch.has_legend:
         ch.legend.position = XL_LEGEND_POSITION.TOP
@@ -674,8 +802,8 @@ def column_chart(s, categories, bars, line=None, area=None, colors=None, labels=
     pal = colors or ([CYAN, ICE, NAVY, GRAY] if line else [BLUE, ICE, CYAN, NAVY, GRAY])
     for se, col in zip(list(ch.plots[0].series)[:len(bars)], pal * 3):
         se.format.fill.solid(); se.format.fill.fore_color.rgb = rgb(col)
-    if line:
-        bar_line_combo(ch, len(bars), BLUE, labels)
+    for k in range(len(line)):  # 每次移走一條，下一條的索引仍是 len(bars)
+        bar_line_combo(ch, len(bars), [BLUE, NAVY, GRAY, CYAN][k % 4], labels)
     pl = ch.plots[0]
     pl.gap_width = 60; pl.overlap = 0
     if labels:
