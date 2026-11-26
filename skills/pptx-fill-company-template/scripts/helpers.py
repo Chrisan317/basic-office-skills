@@ -192,6 +192,7 @@ def save(out_path, check=True):
         msgs += overlap_check(prs)
         if src is not None:
             msgs += chart_check(src, prs)
+            msgs += moved_text(src, prs)
     for w_ in msgs: print("WARN", w_)
     if check and src is not None:
         miss = missing_text(src, prs)
@@ -427,6 +428,64 @@ def missing_text(src_pres, out_pres):
         if seen:
             miss[no] = seen
     return miss
+
+
+def _toks(sl):
+    out = []
+    for _, _, t in _texts_of(sl.shapes):
+        for tok in (x for part in _SEP.split(t) for x in _RUN.findall(part)):
+            tok = tok.strip(".。").lower()
+            if len(tok) >= 2 and not tok.isdigit() and tok not in out:
+                out.append(tok)
+    return out
+
+
+def moved_text(src_pres, out_pres):
+    """找出「來源某頁的字，只出現在對應別的來源頁的輸出頁」：通常是為了消 MISSING 把內容搬到別頁。
+    每個輸出頁先找最像的來源頁（共同字最多），再看來源頁獨有的字有沒有跑到別頁。回傳訊息 list。"""
+    src_t = [_toks(sl) for sl in src_pres.slides]
+    out_b = [re.sub(r"\s+", "", "".join(t for _, _, t in _texts_of(sl.shapes))).lower() for sl in out_pres.slides]
+    # 輸出頁照來源順序排：用動態規劃找「來源頁碼不倒退」且共同字總數最多的對應
+    scores = [[sum(1 for t in ts if t in b) for ts in src_t] for b in out_b]
+    ks = [k for k, sc in enumerate(scores) if sc and max(sc) >= 2]
+    owner = [None] * len(out_b)
+    n = len(src_t)
+    if ks and n:
+        best = [scores[ks[0]][:]]
+        back = [[None] * n]
+        for k in ks[1:]:
+            row, br, run, arg = [], [], -1, 0
+            for i in range(n):
+                if best[-1][i] > run:
+                    run, arg = best[-1][i], i
+                row.append(run + scores[k][i]); br.append(arg)
+            best.append(row); back.append(br)
+        i = max(range(n), key=lambda j: best[-1][j])
+        for step in range(len(ks) - 1, -1, -1):
+            owner[ks[step]] = i
+            if step:
+                i = back[step][i]
+    msgs = []
+    for i, ts in enumerate(src_t):
+        mine = [k for k, o in enumerate(owner) if o == i]
+        if not mine:
+            continue
+        others = set().union(*[set(t) for j, t in enumerate(src_t) if j != i]) if len(src_t) > 1 else set()
+        where = {}
+        for tok in ts:
+            if (tok.isascii() and len(tok) < 4) or tok in others or any(tok in out_b[k] for k in mine):
+                continue
+            for k, b in enumerate(out_b):
+                if tok in b:
+                    where.setdefault(k, []).append(tok)
+                    break
+        for k, toks in where.items():
+            o = owner[k]
+            pages = "、".join(str(m + 1) for m in mine)
+            msgs.append(f"來源第 {i + 1} 頁的字放到了輸出第 {k + 1} 頁（那頁對應來源第 {o + 1 if o is not None else '?'} 頁）："
+                        + "、".join(toks[:8]) + (f" …等 {len(toks)} 處" if len(toks) > 8 else "")
+                        + f"。要放回輸出第 {pages} 頁（版面不夠就縮小表格、用 put_table 讓出側欄），不要搬到別頁")
+    return msgs
 
 # ---------- helpers ----------
 def is_cjk(ch): return ord(ch) > 0x2E80

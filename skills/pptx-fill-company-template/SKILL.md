@@ -32,6 +32,7 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
     - `MISSING 來源第 N 頁：…`：來源有、輸出沒有的字
     - `WARN 第 N 頁：A 和 B 重疊`／`超出投影片`：文字疊到表格、其他文字、範本的圖案（例如結尾頁的 Thank You）
     - `WARN 來源第 N 頁圖表…`：圖表數列少了、折線變長條、數值和來源不同（手打）
+    - `WARN 來源第 N 頁的字放到了輸出第 M 頁`：內容被搬到別頁（例如把放不下的側欄塞到下一頁）
     - `WARN table … 拆成 N 頁`、`overflow?`、`stat_cards…`、`card_grid…`
   - 基本元件：`box`（圓角卡片）、`txt`（文字框，會預估是否溢出）、`table`、`cell_set`、`style_header_row`、`zebra_body`、`set_border`、`fit`、`norm`、`src_table`、`walk_shapes`（會進入群組）、`bar_line_combo`
   - **常用版型**（見下節）：`agenda`、`stat_cards`、`card_grid`、`table_pages`、`put_table`、`column_chart`、`progress_bar`
@@ -106,6 +107,8 @@ description: 套版：把現有內容重做到公司簡報範本（.pptx/.potx�
 5. **處理 save() 印出的每一條**：
    - `MISSING 來源第 N 頁：…` 是來源有、輸出沒有的字（常見：漏掉第二個表格、說明文字、季度數字）。補上，或在回報裡說明為什麼刻意省略。
      **來源的錯字、裝飾字、範本已經有的字（結尾頁的 Thank you、公司名）不要硬加回去**，在回報裡說明就好。不要為了消掉 MISSING 在投影片上疊文字。
+     **也不要把字搬到別頁**（例如把表格頁的標題、圖例、側欄塞到後面的統計頁）：每頁的內容要留在對應的那一頁。
+   - `WARN 來源第 N 頁的字放到了輸出第 M 頁`：把那些字放回原本那頁。表格佔滿放不下側欄時，用 `put_table(s, rows, x, y, w)` 把表格寬度縮小（例如 8.3 吋），右邊放側欄；來源頁上的大標題放進標題，圖例放副標。
    - `WARN … 重疊`、`超出投影片`：改位置或大小。總覽圖太小看不出來，**有這種警告的頁面要打開單頁圖確認**。
    - `WARN 來源第 N 頁圖表…`：改用 `column_chart(s, **src_chart(N))`。
    - `WARN table … 拆成 N 頁`：來源一頁的表格加 `max_pages=1`。
