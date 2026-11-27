@@ -88,7 +88,18 @@ def theme_colors(pres):
         return {}
 
 
-def pick_palette(th):
+def accent_usage(pres):
+    """範本的母片、版面、範例頁實際用了幾次各個 accent 色（範本設計的主色通常用最多次）。"""
+    from collections import Counter
+    cnt = Counter()
+    for part in pres.part.package.iter_parts():
+        name = str(part.partname)
+        if re.match(r"/ppt/(slideMasters|slideLayouts|slides)/[^/]+\.xml$", name):
+            cnt.update(re.findall(r'schemeClr val="(accent\d)"', part.blob.decode("utf-8", "ignore")))
+    return cnt
+
+
+def pick_palette(th, usage=None):
     """從主題色挑調色盤。回傳 {名稱: (顏色, 來源)}。
     BLUE  主色：依 accent1→6 順序，第一個「白底上對比 ≥ 3、有彩度」的（很淺的 accent 會跳過）
     CLOUD 卡片底：和主色同色系、很淺的 accent；沒有就用主色混 85% 白
@@ -104,6 +115,12 @@ def pick_palette(th):
     sat = lambda c: _hsv(c)[1]
     # 依 accent1→6 的順序，取第一個「白底上對比 ≥ 3（大字/白字表頭看得清楚）且有彩度」的顏色
     strong = [(n, c) for n, c in acc if _contrast(c) >= 3 and sat(c) >= 0.25]
+    # 範本實際最常用的 accent（用了 10 次以上、白字還看得清楚）優先當主色：那才是範本的設計色
+    usage = usage or {}
+    used = sorted([(usage.get(n, 0), n, c) for n, c in acc
+                   if usage.get(n, 0) >= 10 and _contrast(c) >= 2.2 and sat(c) >= 0.25], reverse=True)
+    if used and (not strong or used[0][0] >= 3 * max(usage.get(strong[0][0], 0), 1)):
+        strong = [(used[0][1], used[0][2])] + [x for x in strong if x[0] != used[0][1]]
     if not strong:
         return out  # 主題色都太淺或沒有彩度：保留預設調色盤
     bn, blue = strong[0]
@@ -114,6 +131,11 @@ def pick_palette(th):
            and c != blue]
     out["ICE"] = mid[0][::-1] if mid else (_mix(blue, 0.6), f"{bn} 混 60% 白")
     cyan = [(n, c) for n, c in acc if c not in (blue, out["ICE"][0]) and sat(c) >= 0.5 and _contrast(c) >= 1.8]
+    # 範本實際常用的第二個 accent（例如設計裡的萊姆綠）優先當輔色
+    used2 = sorted([(usage.get(n, 0), n, c) for n, c in acc
+                    if c not in (blue, out["ICE"][0]) and usage.get(n, 0) >= 10 and sat(c) >= 0.5], reverse=True)
+    if used2:
+        cyan = [(used2[0][1], used2[0][2])] + [x for x in cyan if x[0] != used2[0][1]]
     if cyan:
         out["CYAN"] = cyan[0][::-1]
     gray = [(n, c) for n, c in acc if sat(c) < 0.12 and _contrast(c) >= 3.5]
@@ -128,7 +150,11 @@ def pick_palette(th):
 def apply_theme_palette(pres, verbose=True):
     """用範本的主題色更新調色盤（見 pick_palette）。回傳主題色 dict。"""
     th = theme_colors(pres)
-    pal = pick_palette(th)
+    try:
+        usage = accent_usage(pres)
+    except Exception:
+        usage = {}
+    pal = pick_palette(th, usage)
     g = globals()
     for name, (col, why) in pal.items():
         g[name] = col
@@ -165,7 +191,10 @@ def init(src_path, tpl_path, theme=True):
     SCALE = max(0.7, min(1.6, prs.slide_height / 914400 / 7.5))
     # 就地更新（不要重新指定）：`from helpers import *` 拿到的 L、orig_ids 才不會是空的舊物件
     orig_ids[:] = list(prs.slides._sldIdLst)
-    L.clear(); L.update({l.name: l for l in prs.slide_layouts})
+    L.clear()
+    for m_ in prs.slide_masters:  # 範本可能有好幾組母片，每組的版面都要讀
+        for l_ in m_.slide_layouts:
+            L.setdefault(l_.name, l_)
     warn.clear()
     print(f"範本版面 {len(L)} 個：" + "、".join(L))
     if os.path.exists(PPT):
@@ -775,7 +804,7 @@ def find_layout(kind):
             return lay
     from pptx.enum.shapes import PP_PLACEHOLDER as P
     deco = {P.DATE, P.FOOTER, P.SLIDE_NUMBER}
-    lays = list(prs.slide_layouts)
+    lays = [l_ for m_ in prs.slide_masters for l_ in m_.slide_layouts]
     if kind == "cover":
         return next((l for l in lays if P.CENTER_TITLE in _ph_types(l)), lays[0])
     if kind == "content":
@@ -784,12 +813,15 @@ def find_layout(kind):
         def top_title(l):  # 標題在上方 1/4（置中大標題的版面不適合放內容）
             return any(ph.placeholder_format.type in (P.TITLE, P.CENTER_TITLE) and ph.top is not None
                        and ph.top / 914400 < Hh * 0.25 for ph in l.placeholders)
+        def low_decor(l):  # 內容區（上方 22% 以下）有幾個範本裝飾：會被內容蓋到，越少越好
+            return sum(1 for sh_ in l.shapes if not sh_.is_placeholder and sh_.top is not None
+                       and sh_.top / 914400 > Hh * 0.22)
         title_only = [l for l in lays if top_title(l) and not (set(_ph_types(l)) - deco - {P.TITLE, P.CENTER_TITLE})]
         if title_only:
-            return title_only[0]
+            return min(title_only, key=low_decor)
         with_body = [l for l in lays if top_title(l) and P.PICTURE not in _ph_types(l)]
         if with_body:
-            return min(with_body, key=lambda l: len(l.placeholders))
+            return min(with_body, key=lambda l: (low_decor(l), len(l.placeholders)))
         blank = [l for l in lays if not (set(_ph_types(l)) - deco)]  # 沒有合適的就用空白版面，標題自己加
         if blank:
             return blank[0]
@@ -820,7 +852,12 @@ def new_slide(layout, title=None):
     return s
 
 
-def set_subtitle(s, text, nth=0, align=None, pos=None):
+def set_subtitle_box(s, text, align=None):
+    """內容頁沒有合適的副標位置：在標題（和頁碼標籤）下方加一個文字框。"""
+    return set_subtitle(s, text, nth=99, align=align, _box=True)
+
+
+def set_subtitle(s, text, nth=0, align=None, pos=None, _box=False):
     """把文字放進第 nth 個（從 0 起算）副標題/內文預留位置；不同範本的 idx 不同，不要寫死 idx。
     封面常有兩個：nth=0 放講者/部門、nth=1 放日期。
     內容頁（有一般標題、副標預留位置又小又在上方）沒給 pos 時，會自動把副標移到標題正下方、
@@ -832,21 +869,32 @@ def set_subtitle(s, text, nth=0, align=None, pos=None):
     phs = sorted([ph for ph in s.placeholders
                   if ph.placeholder_format.type in (P.SUBTITLE, P.BODY) and ph.has_text_frame],
                  key=lambda ph: ph.placeholder_format.idx)
-    if nth >= len(phs):
+    if nth >= len(phs) or _box:
         t = s.shapes.title or next((x for x in s.shapes if x.name == "Title" and not x.is_placeholder), None)
-        if nth == 0 and t is not None and t.top is not None:  # 內容頁：在標題下方補一個文字框
-            W, _ = slide_size()
+        if (nth == 0 or _box) and t is not None and t.top is not None:  # 內容頁：在標題下方補一個文字框
+            W, H_ = slide_size()
             x0, y0 = t.left / 914400, (t.top + t.height) / 914400
+            for ph_ in s.placeholders:  # 標題下方的頁碼標籤等（例如「SLIDE 3」）
+                if ph_ is not t and ph_.top is not None and ph_.top / 914400 < H_ * 0.3 and ph_.has_text_frame \
+                        and ph_.text_frame.text.strip():
+                    y0 = max(y0, (ph_.top + ph_.height) / 914400)
+            if t.width and t.width / 914400 > W * 0.9 and align is None:
+                align = PP_ALIGN.CENTER  # 標題橫跨整頁（置中設計）時副標也置中
+                x0 = 0.5
             x0, y0, w0, h0 = pos or (x0, y0, W - x0 - 0.5, 0.48 * SCALE)
             print(f"set_subtitle：版面「{s.slide_layout.name}」沒有副標預留位置，改在標題下方加文字框")
             return txt(s, x0, y0, w0, h0, [dict(text=text, size=16, bold=True, color=BLUE)],
                        align=align or PP_ALIGN.LEFT, name="Subtitle")
         warn.append(f"set_subtitle：版面「{s.slide_layout.name}」沒有第 {nth} 個副標預留位置，「{text[:12]}」沒有放上去")
         return None
-    ph = phs[nth]
     W, H = slide_size()
     t = s.shapes.title
     is_content = t is not None and t.placeholder_format.type == P.TITLE
+    if is_content:  # 內容頁只用上方的副標位置；下方的內文位置不能拿來放副標
+        phs = [ph for ph in phs if ph.top is not None and ph.top / 914400 < H * 0.3]
+        if nth >= len(phs):
+            return set_subtitle_box(s, text, align)
+    ph = phs[nth]
     if pos is None and is_content and ph.top is not None and ph.top / 914400 < H * 0.3             and ph.height / 914400 < 1.0 and t.top is not None:
         tb = (t.top + t.height) / 914400
         pos = (t.left / 914400, tb, W - t.left / 914400 - 0.5, 0.48 * SCALE)

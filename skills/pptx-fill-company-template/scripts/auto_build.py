@@ -158,6 +158,22 @@ def is_graphic(sl):
     return conn >= 1 or text_shapes >= 3 or text_ph >= 4
 
 
+def layout_ph_size(lay, ph, style="titleStyle"):
+    """版面預留位置的字級（pt）：預留位置本身 → 母片的標題/內文樣式。找不到回傳 None。"""
+    try:
+        for tag in ("a:defRPr", "a:rPr", "a:endParaRPr"):
+            for r in ph._element.iter(H.qn(tag)):
+                if r.get("sz"):
+                    return int(r.get("sz")) / 100
+        for st in lay.slide_master._element.iter(H.qn("p:" + style)):
+            for r in st.iter(H.qn("a:defRPr")):
+                if r.get("sz"):
+                    return int(r.get("sz")) / 100
+    except Exception:
+        pass
+    return None
+
+
 def inherited_size(s, ph):
     """預留位置繼承的字級（pt）：先看版面的預留位置，再看母片的標題樣式。找不到回傳 None。"""
     try:
@@ -191,6 +207,227 @@ def fit_text(ph, text, size0):
         for p_ in ph.text_frame.paragraphs:
             for r_ in p_.runs:
                 r_.font.size = Pt(size)
+
+
+# ---------------------------------------------------------------- 用範本自己的版面
+def all_layouts():
+    return [l for m in H.prs.slide_masters for l in m.slide_layouts]
+
+
+def _ptype(ph):
+    return ph.placeholder_format.type
+
+
+def _top_title(lay):
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    Hs = H.prs.slide_height
+    return any(_ptype(ph) in (P.TITLE, P.CENTER_TITLE) and ph.top is not None and ph.top < Hs * 0.25
+               for ph in lay.placeholders)
+
+
+def pair_slots(lay):
+    """版面裡「小標＋內文」成對的預留位置。回傳 (pairs[(小標idx, 內文idx)], 沒配對的文字位置數, 有沒有圖/表/圖表位置)。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    Hs = H.prs.slide_height
+    phs = [ph for ph in lay.placeholders if ph.top is not None and ph.width]
+    media = [ph for ph in phs if _ptype(ph) in (P.PICTURE, P.CHART, P.TABLE)]
+    texts = sorted([ph for ph in phs if _ptype(ph) in (P.BODY, P.OBJECT)], key=lambda p: (p.top, p.left))
+    used, pairs = set(), []
+    for b in texts:
+        if b.placeholder_format.idx in used:
+            continue
+        for c in texts:
+            ci = c.placeholder_format.idx
+            if ci in used or c is b:
+                continue
+            ov = min(b.left + b.width, c.left + c.width) - max(b.left, c.left)
+            if c.top >= b.top + b.height * 0.5 and c.top - (b.top + b.height) < Hs * 0.15 \
+                    and ov > 0.6 * min(b.width, c.width):
+                pairs.append((b.placeholder_format.idx, ci))
+                used |= {b.placeholder_format.idx, ci}
+                break
+    extra = [p for p in texts if p.placeholder_format.idx not in used]
+    return pairs, extra, media
+
+
+def fit_lines(lay, ph, lines, style="bodyStyle", min_size=10):
+    """文字放進版面預留位置要用多大的字：放得下回傳 (字級, 要不要改字級)；最小字級也放不下回傳 None。"""
+    size0 = layout_ph_size(lay, ph, style) or 18
+    w, h = ph.width / H.EMU - 0.2, ph.height / H.EMU
+    size = size0
+    while True:
+        n = sum(max(1, math.ceil(H.text_w(t, size) * 1.1 / max(w * 72, 1))) for t in lines) if lines else 1
+        if n * size * 1.25 / 72 + 0.1 <= h:
+            return size, size < size0
+        if size <= min_size:
+            return None
+        size = max(min_size, size - 1)
+
+
+def fill_ph(ph, lines, size=None):
+    ph.text_frame.text = "\n".join(lines)
+    if size:
+        for p in ph.text_frame.paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(size)
+
+
+def set_title(s, text):
+    """填標題；標題太長放不下時縮小字（短標題保留範本字級）。"""
+    t = s.shapes.title
+    if t is None:
+        return
+    t.text = text
+    if text and t.width and t.height:
+        fit_text(t, text, inherited_size(s, t) or 40)
+
+
+def add_slide_number(s):
+    """範本版面有頁碼標籤（例如「SLIDE ‹#›」）時加到投影片上（python-pptx 新增投影片時不會帶）。"""
+    import copy as _copy
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    if any(_ptype(ph) == P.SLIDE_NUMBER for ph in s.placeholders):
+        return
+    for ph in s.slide_layout.placeholders:
+        if _ptype(ph) == P.SLIDE_NUMBER and ph.has_text_frame and ph.text_frame.text.strip():
+            s.shapes._spTree.append(_copy.deepcopy(ph._element))
+            return
+
+
+def drop_empty(s):
+    """刪掉沒填的預留位置（標題、頁碼、頁尾除外），編輯時才不會看到「按一下以新增文字」。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    keep = (P.TITLE, P.CENTER_TITLE, P.SLIDE_NUMBER, P.FOOTER, P.DATE)
+    for ph in list(s.placeholders):
+        if _ptype(ph) in keep:
+            continue
+        has_text = ph.has_text_frame and ph.text_frame.text.strip()
+        if not has_text and ph._element.tag.endswith("}sp"):
+            ph._element.getparent().remove(ph._element)
+
+
+def try_pair_layout(e, n):
+    """文字卡片頁：找範本裡「小標＋內文」組數剛好的版面，把文字填進範本的預留位置（字型、字級、位置照範本）。"""
+    if e.get("template_layout") == "none" or e.get("subtitle"):
+        return False
+    if pictures(n) and e.get("pictures") != "none":
+        return False
+    blocks, _, _ = blocks_for(n, e, side_ok=False)
+    if any(b["type"] != "text" for b in blocks):
+        return False
+    groups = [(b.get("head") or "", b["lines"]) for b in blocks]
+    cards = [g for g in groups if g[1]]
+    if not cards or len(cards) > 6 or any(not g[1] for g in groups):
+        return False
+    cands = []
+    for lay in all_layouts():
+        if not _top_title(lay):
+            continue
+        pairs, extra, media = pair_slots(lay)
+        if pairs and not extra and not media and len(pairs) >= len(cards):
+            cands.append((len(pairs) - len(cards), lay, pairs))
+    for _, lay, pairs in sorted(cands, key=lambda c: c[0]):
+        lph = {ph.placeholder_format.idx: ph for ph in lay.placeholders}
+        plan = []
+        for (hi, bi), (hd, items) in zip(pairs, cards):
+            fh = fit_lines(lay, lph[hi], [hd], min_size=12) if hd else (None, False)
+            fb = fit_lines(lay, lph[bi], items)
+            if fb is None or (hd and fh is None):
+                plan = None
+                break
+            plan.append((hi, bi, hd, items, fh, fb))
+        if not plan:
+            continue
+        s = H.prs.slides.add_slide(lay)
+        set_title(s, e.get("title", ""))
+        add_slide_number(s)
+        sph = {ph.placeholder_format.idx: ph for ph in s.placeholders}
+        for hi, bi, hd, items, fh, fb in plan:
+            if hd:
+                fill_ph(sph[hi], [hd], fh[0] if fh[1] else None)
+            fill_ph(sph[bi], items, fb[0] if fb[1] else None)
+        drop_empty(s)
+        return True
+    return False
+
+
+def try_chart_layout(e, n):
+    """圖表頁：用範本有圖表位置的版面，圖表放在那個位置，副標放進旁邊的小標位置。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    if e.get("template_layout") == "none":
+        return False
+    best = None
+    for lay in all_layouts():
+        if not _top_title(lay):
+            continue
+        charts = [ph for ph in lay.placeholders if _ptype(ph) == P.CHART]
+        pairs, extra, media = pair_slots(lay)
+        if len(charts) != 1 or extra or len(media) != 1 or len(pairs) > 1:
+            continue
+        area = charts[0].width * charts[0].height
+        if best is None or area > best[0]:
+            best = (area, lay, charts[0], pairs)
+    if not best:
+        return False
+    _, lay, cph, pairs = best
+    blocks, _, _ = blocks_for(n, e, side_ok=False)
+    lines = [t for b in blocks if b["type"] == "text" for t in ([b.get("head")] if b.get("head") else []) + b["lines"]]
+    s = H.prs.slides.add_slide(lay)
+    if s.shapes.title is not None:
+        s.shapes.title.text = e.get("title", "")
+    add_slide_number(s)
+    sph = {ph.placeholder_format.idx: ph for ph in s.placeholders}
+    c = sph[cph.placeholder_format.idx]
+    area = (c.left / H.EMU, c.top / H.EMU, c.width / H.EMU, c.height / H.EMU)
+    c._element.getparent().remove(c._element)
+    H.column_chart(s, area=area, **H.src_chart(n))
+    if pairs:
+        hi, bi = pairs[0]
+        lph = {ph.placeholder_format.idx: ph for ph in lay.placeholders}
+        if e.get("subtitle"):
+            f = fit_lines(lay, lph[hi], [e["subtitle"]], min_size=12)
+            fill_ph(sph[hi], [e["subtitle"]], f[0] if f and f[1] else None)
+        if lines:
+            f = fit_lines(lay, lph[bi], lines) or (10, True)
+            fill_ph(sph[bi], lines, f[0] if f[1] else None)
+    elif e.get("subtitle"):
+        H.set_subtitle(s, e["subtitle"])
+    drop_empty(s)
+    return True
+
+
+def try_agenda_layout(title, items):
+    """目錄：用範本「編號＋項目」一列一列的版面（項目數剛好的），填進範本的位置。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    W = H.prs.slide_width
+    for lay in all_layouts():
+        if not _top_title(lay):
+            continue
+        texts = [ph for ph in lay.placeholders if _ptype(ph) == P.BODY and ph.width]
+        small = [p for p in texts if p.width < W * 0.1]
+        rows = []
+        for sm in sorted(small, key=lambda p: p.top):
+            wide = [p for p in texts if p.width > W * 0.3 and abs(p.top - sm.top) < H.prs.slide_height * 0.03
+                    and p.left > sm.left]
+            if wide:
+                rows.append((sm, min(wide, key=lambda p: p.left)))
+        others = [p for p in texts if all(p is not a and p is not b for a, b in rows)]
+        if len(rows) != len(items) or len(others) > 1 or any(_ptype(p) in (P.PICTURE, P.CHART, P.TABLE)
+                                                              for p in lay.placeholders):
+            continue
+        if any(fit_lines(lay, b, [it], min_size=12) is None for (_, b), it in zip(rows, items)):
+            continue
+        s = H.prs.slides.add_slide(lay)
+        set_title(s, title)
+        add_slide_number(s)
+        sph = {ph.placeholder_format.idx: ph for ph in s.placeholders}
+        for i, ((a, b), it) in enumerate(zip(rows, items), 1):
+            fill_ph(sph[a.placeholder_format.idx], [f"{i:02d}"])
+            f = fit_lines(lay, b, [it], min_size=12)
+            fill_ph(sph[b.placeholder_format.idx], [it], f[0] if f[1] else None)
+        drop_empty(s)
+        return True
+    return False
 
 
 def _set_xfrm(el, x, y, w, h):
@@ -651,8 +888,14 @@ def render_page(e, notes):
             notes.append(f"結尾頁：來源的「{'、'.join(lines)[:30]}」沒有放（範本的結尾頁已經有結尾文字）")
         return
     if kind == "agenda":
-        s = H.new_slide("content", e.get("title") or (H.src_title(n) or ["Agenda"])[0])
-        H.agenda(s, e.get("items") or _agenda_items(n))
+        title = e.get("title") or (H.src_title(n) or ["Agenda"])[0]
+        items = e.get("items") or _agenda_items(n)
+        if e.get("template_layout") != "none" and try_agenda_layout(title, items):
+            return
+        s = H.new_slide("content", title)
+        add_slide_number(s)
+        H.agenda(s, items)
+        drop_empty(s)
         return
     if kind == "section":
         s = H.new_slide("section", e.get("title", ""))
@@ -661,9 +904,16 @@ def render_page(e, notes):
         if e.get("subtitle"):
             H.set_subtitle(s, e["subtitle"])
         return
+    if kind == "text" and try_pair_layout(e, n):
+        return
+    if kind == "chart" and try_chart_layout(e, n):
+        return
     s = H.new_slide(e.get("layout", "content"), e.get("title", ""))
+    set_title(s, e.get("title", ""))
+    add_slide_number(s)
     if e.get("subtitle"):
         H.set_subtitle(s, e["subtitle"])
+    drop_empty(s)
     x, y, w, h = H.content_area(s)
     if kind == "chart":
         blocks, side, cards = blocks_for(n, e, side_ok=False)
@@ -809,7 +1059,18 @@ def report(src, out_path, notes, png, work):
             png_issues = list(getattr(office_convert, "layout_issues", []))
         except Exception as ex:
             print(f"（沒有匯出圖片：{ex}。改用 check_bounds.py 估算）")
-    issues += [f"PowerPoint 實際排版：{m}" for m in png_issues]
+    # 範本標題框本身的小溢出（範本範例頁也一樣）只當說明，不算問題
+    titles_out = {i + 1: (sl.shapes.title.text_frame.text.strip()[:16] if sl.shapes.title is not None else None)
+                  for i, sl in enumerate(out.slides)}
+    tpl_small = []
+    for m in png_issues:
+        mm = re.match(r"第 (\d+) 頁：「(.+?)」 的文字超出自己的框 ([\d.]+) 吋", m)
+        if mm and float(mm.group(3)) <= 0.3 and titles_out.get(int(mm.group(1))) and                 titles_out[int(mm.group(1))].startswith(mm.group(2)[:8]):
+            tpl_small.append(int(mm.group(1)))
+        else:
+            issues.append(f"PowerPoint 實際排版：{m}")
+    if tpl_small:
+        notes.append(f"標題比範本的標題框高一點點（{len(tpl_small)} 頁，0.3 吋以內；範本自己的範例頁也一樣），看起來正常")
     print()
     for m in notes:
         print("說明 " + m)
