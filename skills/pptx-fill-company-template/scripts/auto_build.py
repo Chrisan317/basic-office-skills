@@ -638,6 +638,15 @@ def render_page(e, notes):
         if s is None:  # 範本沒有結尾版面：用來源的結尾字當標題
             s = H.new_slide("section", lines[0] if lines else "") or H.new_slide("content", lines[0] if lines else "")
             notes.append("範本沒有結尾版面，用" + ("章節頁" if s.slide_layout.name else "內容頁") + "放來源的結尾文字")
+        elif s.shapes.title is not None and not s.shapes.title.text_frame.text.strip():
+            # 結尾版面的標題是空的：用範本範例頁（同一個版面）上的結尾字，例如「Thank You!」
+            sample = next((sl.shapes.title.text_frame.text for sl in H.prs.slides
+                           if sl is not s and sl.slide_layout == s.slide_layout and sl.shapes.title is not None
+                           and sl.shapes.title.text_frame.text.strip()), "")
+            sample = re.sub(r"[\ue000-\uf8ff]", "", sample).strip()  # 去掉圖示字型的私用字元
+            s.shapes.title.text = sample or (lines[0] if lines else "Thank You")
+            if lines and sample:
+                notes.append(f"結尾頁：用範本的「{sample}」，來源的「{'、'.join(lines)[:30]}」沒有放")
         elif lines:
             notes.append(f"結尾頁：來源的「{'、'.join(lines)[:30]}」沒有放（範本的結尾頁已經有結尾文字）")
         return

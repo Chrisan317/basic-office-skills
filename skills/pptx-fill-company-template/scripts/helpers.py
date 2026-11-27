@@ -758,7 +758,7 @@ KIND_NAMES = {
     "closing": ["Closing", "Closing Slide", "Closing Slide_Dark", "End", "Thank You", "結尾", "謝謝"],
 }
 _KIND_WORDS = {"cover": ("cover", "title slide", "封面"), "section": ("section", "secton", "區段", "章節", "구역"),
-               "closing": ("closing", "end", "thank", "結尾", "謝謝")}
+               "closing": ("closing", "end", "thank", "tnank", "thx", "you", "q&a", "question", "結尾", "謝謝", "감사")}
 
 
 def _ph_types(layout):
