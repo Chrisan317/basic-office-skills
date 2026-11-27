@@ -15,7 +15,7 @@
 | `skills/word-docx` | 讀成 Markdown、保留格式的批次取代、建立文件（已處理中文 eastAsia 字型）、轉 PDF、.doc 轉 .docx |
 | `skills/excel-xlsx` | 看結構、pandas 分析、做報表、加公式與格式、修改不洗掉原格式、CSV 自動判斷編碼（utf-8/cp950/big5） |
 | `skills/powerpoint-pptx` | 讀每頁內容與備忘稿、列出範本版面、用 python-pptx 建簡報、轉 PDF、每頁匯出 PNG |
-| `skills/pptx-fill-company-template` | 套版：把舊簡報或 md/txt/csv/xlsx/docx 的內容重建到任何公司範本上；自動偵測版面、讀範本主題色、16:9/4:3 皆可、表格自動分頁 |
+| `skills/pptx-fill-company-template` | 套版：把舊簡報或 md/txt/csv/xlsx/docx 的內容重建到任何公司範本上。簡報來源用 `auto_build.py` 一個指令完成（分析每頁 → 頁面計畫 plan.json → 產生 → 自動檢查），16:9/4:3 皆可 |
 | `skills/office-writing` | 台灣職場文書格式：Email、會議記錄、週報、簽呈、公告、摘要 |
 | `skills/make-skill` | 說「把這個做法存成技能」，agent 會自己照規格建立新技能 |
 
@@ -75,6 +75,14 @@ python skills/excel-xlsx/scripts/xlsx_tool.py info 銷售.xlsx
 ```
 
 模型不支援圖片時，改用 `ocr` 指令轉成文字即可。
+
+## 測試
+
+```
+python tests/run_tests.py                      # 用虛構的測試簡報跑 auto_build，統計自動檢查的問題數
+python tests/run_tests.py 來源.pptx 範本.pptx   # 另外加測自己的檔案（輸出在 tests/samples/，不會提交）
+```
+加 `--png` 會匯出圖片並做 PowerPoint 實際排版檢查。修改 `auto_build.py`／`helpers.py` 後要整組重跑，問題數不能變多。
 
 ## 授權
 

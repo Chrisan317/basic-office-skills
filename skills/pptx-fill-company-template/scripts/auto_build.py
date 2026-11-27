@@ -1,0 +1,569 @@
+"""把來源簡報（pptx）自動套到公司範本：分析每頁 → 寫出頁面計畫 plan.json → 依計畫產生 → 自動檢查。
+
+用法：
+  python auto_build.py 來源.pptx 範本.pptx 輸出.pptx
+      第一次執行：分析來源，寫出 _work/plan.json，產生輸出並檢查。
+  python auto_build.py 來源.pptx 範本.pptx 輸出.pptx --plan _work/plan.json
+      照修改過的計畫重新產生（只改 plan.json，不要改這支程式）。
+  其他選項：--work 資料夾（預設是輸出檔旁邊的 _work）、--no-png（不匯出圖片）
+
+文字一律在產生時從來源讀，計畫裡只記「哪一頁、用什麼版型」，所以不會漏字、也不會出現自己編的字。
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import helpers as H  # noqa: E402
+from pptx.util import Inches, Pt  # noqa: E402
+from pptx.enum.text import PP_ALIGN  # noqa: E402
+
+AGENDA_WORDS = ("agenda", "目錄", "大綱", "outline", "contents", "議程")
+KINDS = ("cover", "agenda", "table", "chart", "text", "closing", "section", "custom", "skip")
+
+
+# ---------------------------------------------------------------- 讀來源
+def _all_shapes(shapes, tf=(0.0, 0.0, 1.0, 1.0)):
+    """所有形狀（含群組內），回傳 (shape, 左, 上, 寬, 高) 吋。"""
+    E = H.EMU
+    ox, oy, sx, sy = tf
+    for sh in shapes:
+        l, t = (sh.left or 0) / E, (sh.top or 0) / E
+        w, h = (sh.width or 0) / E, (sh.height or 0) / E
+        L_, T_, W_, H_ = ox + l * sx, oy + t * sy, w * sx, h * sy
+        if sh.shape_type == 6:
+            x = sh._element.find(".//" + H.qn("a:chOff")); e = sh._element.find(".//" + H.qn("a:chExt"))
+            cx, cy = (int(x.get("x")) / E, int(x.get("y")) / E) if x is not None else (0, 0)
+            cw, ch = (int(e.get("cx")) / E, int(e.get("cy")) / E) if e is not None else (w, h)
+            nsx, nsy = (W_ / cw if cw else sx), (H_ / ch if ch else sy)
+            yield from _all_shapes(sh.shapes, (L_ - cx * nsx, T_ - cy * nsy, nsx, nsy))
+        else:
+            yield sh, L_, T_, W_, H_
+
+
+def _max_size(sh):
+    ss = [r.font.size.pt for p in sh.text_frame.paragraphs for r in p.runs if r.font.size]
+    return max(ss) if ss else 0
+
+
+def _clean(t):
+    """去掉前後的裝飾符號（例如「- 名字-」）。"""
+    return re.sub(r"^[\s\-–—_~·•]+|[\s\-–—_~·•]+$", "", t)
+
+
+PAIR = re.compile(r"([^:：\s][^:：]*?)\s*[:：]\s*([-+]?\d[\d,]*(?:\.\d+)?)\s*([%％]|[^\s\d:：]{1,2})?(?=\s|$)")
+
+
+def _pairs(line):
+    """「標籤：數字單位」的組合。整行都是這種組合才算（中間只能有空白）。"""
+    out, rest = [], line
+    for m in PAIR.finditer(line):
+        out.append((m.group(1).strip(), m.group(2), (m.group(3) or "").strip()))
+    leftover = PAIR.sub("", line).strip()
+    return out if out and not leftover else []
+
+
+def analyze(src, n, total, agenda_items):
+    """分析來源第 n 頁，回傳計畫的一筆（只記結構，不記內文）。"""
+    sl = src.slides[n - 1]
+    items = list(_all_shapes(sl.shapes))
+    tables = [(sh, l, t, w, h) for sh, l, t, w, h in items if getattr(sh, "has_table", False) and sh.has_table]
+    charts = [(sh, l, t, w, h) for sh, l, t, w, h in items if getattr(sh, "has_chart", False) and sh.has_chart]
+    titles = H.src_title(n)
+    cards = H.src_cards(n, pos=True)
+    chars = sum(len(x) for c in cards for x in [c["head"]] + c["items"]) + sum(len(t) for t in titles)
+    e = dict(src=n)
+    low = " ".join(titles).lower()
+    if n == 1 and not tables and not charts:
+        e["kind"] = "cover"
+    elif n == total and n > 1 and not tables and not charts and chars <= 30:
+        e["kind"] = "closing"
+    elif titles and any(w in titles[0].lower() for w in AGENDA_WORDS) and not tables:
+        e["kind"] = "agenda"
+    elif charts:
+        e["kind"] = "chart"
+    elif tables:
+        e["kind"] = "table"
+    else:
+        e["kind"] = "text"
+    if e["kind"] in ("table", "chart", "text"):
+        t0, sub = _titles(titles, agenda_items)
+        e["title"] = t0
+        if sub:
+            e["subtitle"] = sub
+    if e["kind"] == "text":
+        heads = [c for c in cards if c["items"]]
+        e["cols"] = len(heads) if 2 <= len(heads) <= 3 else 2
+    return e
+
+
+def _titles(titles, agenda_items):
+    """決定標題和副標：章節名（和目錄同名）有其他標題時讓位；太長的標題在冒號處拆成標題＋副標。"""
+    ts = [t for t in titles if t]
+    if len(ts) > 1 and ts[0] in agenda_items:
+        ts = ts[1:] + [ts[0]]
+        ts = ts[:-1]  # 章節名在目錄頁已經有了
+    if not ts:
+        return "", ""
+    t0, rest = ts[0], ts[1:]
+    if len(t0) > 22 and re.search(r"[:：]", t0):
+        a, b = re.split(r"[:：]", t0, maxsplit=1)
+        if a.strip() and b.strip():
+            t0, rest = a.strip(), [b.strip()] + rest
+    rest = [r for r in rest if r not in t0]
+    return t0, "　".join(rest)
+
+
+def make_plan(src):
+    total = len(src.slides)
+    agenda_items = []
+    for n in range(1, total + 1):  # 先找目錄頁，章節名稱給其他頁判斷標題用
+        ts = H.src_title(n)
+        if ts and any(w in ts[0].lower() for w in AGENDA_WORDS):
+            agenda_items = _agenda_items(n)
+            break
+    return dict(version=1, pages=[analyze(src, n, total, agenda_items) for n in range(1, total + 1)])
+
+
+def _agenda_items(n):
+    out = []
+    for c in H.src_cards(n):
+        for x in ([c[0]] if c[0] else []) + c[1]:
+            x = re.sub(r"^\s*(\d+|[IVX]+)[.、)]\s*", "", x).strip()
+            if x:
+                out.append(x)
+    return out
+
+
+# ---------------------------------------------------------------- 產生
+def table_rows(tb):
+    return [[H.cell_lines(c) for c in r.cells] for r in tb.rows]
+
+
+def header_rows(tb):
+    """表頭有合併儲存格（上下或左右合併）時，表頭算兩列。"""
+    try:
+        r0 = list(tb.rows[0].cells)
+        if len(tb.rows) > 2 and any(c.is_merge_origin and (c.span_height > 1 or c.span_width > 1) for c in r0):
+            return 2
+    except Exception:
+        pass
+    return 1
+
+
+def est_table_h(rows, size, w, compact):
+    widths = H.col_widths(rows, size, w)
+    pad, ln = (0.02, 1.2) if compact else (0.04, H.LINE)
+    min_h = size * ln / 72 + (0.02 if compact else 0.05)
+    return sum(H.row_height(r, widths, size, min_h, pad, ln) for r in rows), widths
+
+
+def place_table(s, src_tb, x, y, w, size, compact, bold_last=False):
+    rows = table_rows(src_tb)
+    ncol = max(len(r) for r in rows)
+    rows = [(list(r) + [""] * ncol)[:ncol] for r in rows]
+    total_h, widths = est_table_h(rows, size, w, compact)
+    pad, ln = (0.02, 1.2) if compact else (0.04, H.LINE)
+    min_h = size * ln / 72 + (0.02 if compact else 0.05)
+    hs = [H.row_height(r, widths, size, min_h, pad, ln) for r in rows]
+    nh = header_rows(src_tb)
+    body = rows[nh:]
+    aligns = {c: H.C for c in range(ncol) if c > 0 and body and all(H.is_num(r[c]) for r in body if r[c])}
+    t = H.table(s, x, y, widths, len(rows), hs)
+    for r in range(nh):
+        H.style_header_row(t, r, rows[r], size)
+    last = bold_last or (body and re.search(r"^(總計|合計|小計|total|sum)", " ".join(body[-1][0]).strip(), re.I))
+    H.zebra_body(t, nh, body, size, aligns, bold_last=bool(last))
+    if compact:
+        for r_ in t.rows:
+            for c_ in r_.cells:
+                c_.margin_top = c_.margin_bottom = Inches(0.01)
+    _copy_merges(src_tb, t, nh)
+    _copy_colors(src_tb, t)
+    return y + sum(hs), size
+
+
+def _copy_merges(src_tb, t, nh):
+    """表頭的合併儲存格照來源合併。"""
+    try:
+        for r in range(nh):
+            for c, cell in enumerate(src_tb.rows[r].cells):
+                if cell.is_merge_origin and (cell.span_height > 1 or cell.span_width > 1):
+                    r2 = min(r + cell.span_height - 1, len(t.rows) - 1)
+                    c2 = min(c + cell.span_width - 1, len(t.columns) - 1)
+                    t.cell(r, c).merge(t.cell(r2, c2))
+    except Exception:
+        pass
+
+
+def _copy_colors(src_tb, t):
+    """來源用顏色表示狀態（例如紅色 ●）時保留：有明確設定、不是黑白的字色照抄。"""
+    for r, row in enumerate(src_tb.rows):
+        if r >= len(t.rows):
+            break
+        for c, cell in enumerate(row.cells):
+            if c >= len(t.columns):
+                break
+            cols = [H.run_color(run) for p in cell.text_frame.paragraphs for run in p.runs if run.text.strip()]
+            cols = [x for x in cols if x and re.fullmatch(r"[0-9A-F]{6}", x) and x not in ("000000", "FFFFFF")]
+            if not cols:
+                continue
+            for p in t.cell(r, c).text_frame.paragraphs:
+                for run in p.runs:
+                    run.font.color.rgb = H.rgb(cols[0])
+
+
+def text_paras(lines, size, head=None):
+    ps = []
+    if head:
+        ps.append(dict(text=head, size=size + 1, bold=True, color=H.NAVY, after=2))
+    ps += [dict(text=x, size=size, color=H.BLACK, after=2) for x in lines]
+    return ps
+
+
+def build_flow(s, e, blocks, area):
+    """依來源由上而下的順序排：數字卡片、文字段落、表格、成對數字小表。表格自動挑字級放進剩下的高度。"""
+    x, y, w, h = area
+    gap = 0.18
+    fixed, tables = 0.0, []
+    for b in blocks:
+        if b["type"] == "stats":
+            b["h"] = 1.05
+        elif b["type"] == "text":
+            b["size"] = 12
+            b["h"] = H.est_h([(p["text"], p["size"], p["after"]) for p in text_paras(b["lines"], 12, b.get("head"))], w - 0.1) + 0.1
+        elif b["type"] == "pairs":
+            b["h"] = 0.3 * (len(b["rows"]) + 1) + (0.35 if b.get("caption") else 0)
+        if b["type"] != "table":
+            fixed += b["h"] + gap
+        else:
+            tables.append(b)
+    budget = h - fixed - gap * len(tables)
+    # 表格字級：所有表格用同一個字級，從 12pt 往下試，放不下再用緊湊列高，最小 8pt
+    choice = None
+    for size, compact in [(12, False), (11, False), (10, False), (10, True), (9, True), (8.5, True), (8, True)]:
+        need = sum(est_table_h(table_rows(b["tb"]), size, w, compact)[0] for b in tables)
+        choice = (size, compact)
+        if need <= budget:
+            break
+    for b in blocks:
+        if b["type"] == "stats":
+            H.stat_cards(s, b["items"], x=x, y=y, w=w, h=b["h"], value_size=28)
+            y += b["h"] + gap
+        elif b["type"] == "text":
+            H.txt(s, x, y, w, b["h"], text_paras(b["lines"], b["size"], b.get("head")))
+            y += b["h"] + gap
+        elif b["type"] == "pairs":
+            if b.get("caption"):
+                H.txt(s, x, y, w, 0.32, [dict(text=b["caption"], size=13, bold=True, color=H.NAVY)])
+                y += 0.35
+            rows = [b["header"]] + b["rows"]
+            _, y2 = H.put_table(s, rows, x, y, min(w, 1.6 * len(b["header"]) + 0.5), size=11, name="數字表")
+            y = y2 + gap
+        elif b["type"] == "table":
+            y, _ = place_table(s, b["tb"], x, y, w, choice[0], choice[1])
+            y += gap
+    if tables and choice and choice[0] < 10:
+        e.setdefault("_notes", []).append(f"表格用 {choice[0]}pt 才放得進一頁，請使用者確認字會不會太小")
+
+
+def side_panel(s, cards, x, y, w, h):
+    H.box(s, x, y, w, h, H.CLOUD)
+    paras = []
+    for c in cards:
+        if c["head"]:
+            paras.append(dict(text=c["head"], size=14, bold=True, color=H.BLUE, after=4))
+        paras += [dict(text=t, size=11, color=H.BLACK, after=4) for t in c["items"]]
+    size_scale = 1.0
+    while size_scale > 0.7 and H.est_h([(p["text"], p["size"] * size_scale, p["after"]) for p in paras], w - 0.4) > h - 0.3:
+        size_scale -= 0.05
+    for p in paras:
+        p["size"] = round(p["size"] * size_scale, 1)
+    H.txt(s, x + 0.15, y + 0.12, w - 0.3, h - 0.2, paras)
+
+
+def blocks_for(n, e, side_ok=True):
+    """把來源頁的內容分成排版區塊：表格、數字卡片、成對數字表、文字；表格旁邊的文字當側欄。"""
+    sl = H.src.slides[n - 1]
+    items = list(_all_shapes(sl.shapes))
+    tables = sorted([(sh, l, t, w, h) for sh, l, t, w, h in items if getattr(sh, "has_table", False) and sh.has_table],
+                    key=lambda x: x[2])
+    cards = H.src_cards(n, pos=True)
+    side = []
+    if tables and side_ok and e.get("side", "auto") != "none":
+        big = max(tables, key=lambda x: x[3] * x[4])
+        _, bl, bt, bw, bh = big
+        for c in cards:
+            beside = c["l"] >= bl + bw * 0.75 and c["t"] < bt + bh and c["b"] > bt + 0.3
+            if beside and (len(c["items"]) >= 1):
+                side.append(c)
+    rest = [c for c in cards if c not in side]
+    blocks = []
+    # 成對數字：「A：23 B：17 C：73%」很多行、標籤一樣 → 小表格；只有一兩個 → 數字卡片
+    stat_items, pair_rows, pair_hdr, texts = [], [], None, []
+    pair_caption, row_t = None, None
+    for c in rest:
+        # 同一列（上緣差 0.5 吋內）的卡片用同一個排序值，保留 src_cards 的左→右順序
+        row_t = c["t"] if row_t is None or abs(c["t"] - row_t) >= 0.5 else row_t
+        lines = ([c["head"]] if c["head"] else []) + c["items"]
+        # 整張卡片都是「標籤：數字」（每行 1–2 組）才做成數字卡片
+        if lines and all(1 <= len(_pairs(ln)) <= 2 for ln in lines) and len(lines) <= 3:
+            for ln in lines:
+                stat_items += _pairs(ln)
+            continue
+        kept = []
+        for li, ln in enumerate(lines):
+            pr = _pairs(ln)
+            if li == 0 and 1 <= len(pr) <= 2:  # 卡片第一行就是「標籤：數字」→ 數字卡片
+                stat_items += pr
+                continue
+            if len(pr) >= 3:
+                pre = re.match(r"^([A-Za-z]?\d{1,2}|[一二三四]季|Q\d)", pr[0][0])
+                key = pre.group(1) if pre else ""
+                labels = [pr[0][0][len(key):].strip()] + [p[0] for p in pr[1:]]
+                hdr = [""] + labels if key else labels
+                if pair_hdr is None or pair_hdr == hdr:
+                    if pair_hdr is None and kept and not _pairs(kept[-1]) and len(kept[-1]) <= 20:
+                        pair_caption = kept.pop()  # 數字表上方的小標（例如「每季○○」）
+                    pair_hdr = hdr
+                    pair_rows.append(([key] if key else []) + [p[1] + p[2] for p in pr])
+                    continue
+            kept.append(ln)
+        if kept:
+            head = c["head"] if c["head"] and c["head"] in kept[:1] else None
+            body = kept[1:] if head else kept
+            texts.append(dict(type="text", head=head, lines=body, t=row_t))
+    if len(stat_items) > 6:  # 太多就不做卡片，當文字
+        texts.append(dict(type="text", head=None, lines=[f"{a}：{b}{u}" for a, b, u in stat_items], t=0))
+        stat_items = []
+    if stat_items:
+        blocks.append(dict(type="stats", items=stat_items, t=-1))
+    for tb in tables:
+        blocks.append(dict(type="table", tb=tb[0].table, t=tb[2]))
+    if pair_rows and len(pair_rows) >= 2:
+        blocks.append(dict(type="pairs", header=pair_hdr, rows=pair_rows, caption=pair_caption,
+                           t=min([c["t"] for c in rest] or [0])))
+    elif pair_rows:  # 只有一行就當文字
+        texts.append(dict(type="text", head=pair_caption, lines=[" ".join(r) for r in pair_rows], t=0))
+    blocks += texts
+    blocks.sort(key=lambda b: b["t"])  # sort 是穩定的：同一列維持左→右
+    return blocks, side, cards
+
+
+def render_page(e, notes):
+    kind = e.get("kind", "text")
+    n = e.get("src")
+    if kind == "skip":
+        notes.append(f"來源第 {n} 頁：計畫設成 skip，沒有產生（{e.get('reason', '沒有寫原因')}）")
+        return
+    if kind == "custom":
+        s = H.new_slide(e.get("layout", "content"), e.get("title", ""))
+        path = e.get("script")
+        code = open(path, encoding="utf-8").read()
+        env = dict(vars(H)); env.update(s=s, src_no=n, H=H)
+        exec(compile(code, path, "exec"), env)
+        return
+    if kind == "cover":
+        boxes = []
+        for sh, l, t, w, h in H._abs_boxes(H.src.slides[n - 1].shapes):
+            for i, ln in enumerate(H._lines(sh)):
+                boxes.append((_max_size(sh) if i == 0 else _max_size(sh) * 0.5, t + i * 0.01, _clean(ln)))
+        boxes = [b for b in boxes if b[2]]
+        boxes.sort(key=lambda b: (-b[0], b[1]))
+        title = e.get("title") or (boxes[0][2] if boxes else "")
+        rest = [b[2] for b in sorted(boxes[1:], key=lambda b: b[1])] if not e.get("title") else [b[2] for b in boxes if b[2] != title]
+        date_re = re.compile(r"\d{4}|\d{1,2}/\d{1,2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|月", re.I)
+        dates = [r for r in rest if date_re.search(r)]
+        others = [r for r in rest if r not in dates]
+        s = H.new_slide("cover", title)
+        from pptx.enum.shapes import PP_PLACEHOLDER as P
+        nsub = len([ph for ph in s.placeholders if ph.placeholder_format.type in (P.SUBTITLE, P.BODY)])
+        sub, date = e.get("subtitle", "　".join(others)), e.get("date", "　".join(dates))
+        if nsub >= 2:
+            if sub:
+                H.set_subtitle(s, sub)
+            if date:
+                H.set_subtitle(s, date, nth=1)
+        elif sub or date:  # 範本封面只有一個副標位置：分兩行放
+            H.set_subtitle(s, "\n".join(x for x in (sub, date) if x))
+        return
+    if kind == "closing":
+        lines = H.src_title(n) + [x for c in H.src_cards(n) for x in ([c[0]] if c[0] else []) + c[1]]
+        s = H.new_slide("closing")
+        if s is None:  # 範本沒有結尾版面：用來源的結尾字當標題
+            s = H.new_slide("section", lines[0] if lines else "") or H.new_slide("content", lines[0] if lines else "")
+            notes.append("範本沒有結尾版面，用" + ("章節頁" if s.slide_layout.name else "內容頁") + "放來源的結尾文字")
+        elif lines:
+            notes.append(f"結尾頁：來源的「{'、'.join(lines)[:30]}」沒有放（範本的結尾頁已經有結尾文字）")
+        return
+    if kind == "agenda":
+        s = H.new_slide("content", e.get("title") or (H.src_title(n) or ["Agenda"])[0])
+        H.agenda(s, e.get("items") or _agenda_items(n))
+        return
+    if kind == "section":
+        s = H.new_slide("section", e.get("title", ""))
+        if s is None:
+            s = H.new_slide("content", e.get("title", ""))
+        return
+    s = H.new_slide(e.get("layout", "content"), e.get("title", ""))
+    if e.get("subtitle"):
+        H.set_subtitle(s, e["subtitle"])
+    x, y, w, h = H.content_area(s)
+    if kind == "chart":
+        blocks, side, cards = blocks_for(n, e, side_ok=False)
+        txts = [b for b in blocks if b["type"] == "text"]
+        for b in txts:
+            hh = H.est_h([(p["text"], p["size"], p["after"]) for p in text_paras(b["lines"], 12, b.get("head"))], w) + 0.1
+            H.txt(s, x, y, w, hh, text_paras(b["lines"], 12, b.get("head")))
+            y += hh + 0.1
+        H.column_chart(s, area=(x, y, w, h - (y - H.content_area(s)[1])), **H.src_chart(n))
+        return
+    if kind == "table":
+        blocks, side, _ = blocks_for(n, e)
+        if side:
+            sw = float(e.get("side_width", 3.4))
+            build_flow(s, e, blocks, (x, y, w - sw - 0.25, h))
+            side_panel(s, side, x + w - sw, y, sw, min(h, 0.6 + 0.4 * sum(1 + len(c["items"]) for c in side) + 0.6))
+        else:
+            build_flow(s, e, blocks, (x, y, w, h))
+        notes += e.pop("_notes", [])
+        return
+    # text
+    blocks, _, cards = blocks_for(n, e, side_ok=False)
+    other = [b for b in blocks if b["type"] != "text"]
+    txt_blocks = [b for b in blocks if b["type"] == "text"]
+    if other:  # 先放數字卡片、數字表
+        x0, y0, w0, h0 = x, y, w, h
+        build_flow(s, e, other, (x0, y0, w0, h0))
+        used = sum((b.get("h") or 0) + 0.18 for b in other)
+        y += used
+        h -= used
+    groups = [(b.get("head") or "", b["lines"]) for b in txt_blocks]
+    with_items = [g for g in groups if g[1]]
+    heads_only = [g[0] for g in groups if not g[1] and g[0]]
+    if with_items:
+        cols = int(e.get("cols", 2))
+        if len(with_items) == 1:
+            cols = 1
+        H.card_grid(s, with_items, cols=cols, area=(x, y, w, h - (0.4 if heads_only else 0)))
+        y_end = max((sh.top + sh.height) / H.EMU for sh in s.shapes if sh.top is not None)
+    else:
+        y_end = y
+    if heads_only:  # 只有標題沒有內容的區塊：只放標題，不補「無」
+        H.txt(s, x, min(y_end + 0.15, H.slide_size()[1] - 0.8), w, 0.4,
+              [dict(text=t, size=12, bold=True, color=H.NAVY, after=2) for t in heads_only])
+
+
+# ---------------------------------------------------------------- 主程式
+def report(src, out_path, notes, png, work):
+    H.prs = None
+    from pptx import Presentation
+    out = Presentation(out_path)
+    issues = []
+    issues += H.overlap_check(out)
+    issues += H.chart_check(src, out)
+    issues += H.moved_text(src, out)
+    issues += H.structure_check(src, out)
+    miss = H.missing_text(src, out)
+    closing_src = [p["src"] for p in PLAN["pages"] if p.get("kind") == "closing"]
+    for no, toks in miss.items():
+        if no in closing_src:
+            continue
+        issues.append(f"MISSING 來源第 {no} 頁：" + "、".join(toks[:15]) + (f" …等 {len(toks)} 處" if len(toks) > 15 else ""))
+    issues += [w for w in H.warn if not w.startswith("overflow?")]
+    issues += [w for w in H.warn if w.startswith("overflow?")]
+    png_issues = []
+    if png:
+        try:
+            sys.path.insert(0, os.path.join(HERE, "..", "..", "powerpoint-pptx", "scripts"))
+            import office_convert
+            rep = []
+            folder = os.path.join(work, "out_png")
+            files = office_convert.export_slides(out_path, folder, report=rep)
+            print(f"已匯出 {len(files)} 張圖到 {folder}（{rep[-1] if rep else ''}）")
+            try:
+                import pptx_tool
+                sheets = pptx_tool.overview_sheets(files)
+                for s_ in sheets:
+                    print("  總覽圖：" + s_)
+            except Exception as ex:
+                print(f"（總覽圖沒做成：{ex}）")
+            png_issues = list(getattr(office_convert, "layout_issues", []))
+        except Exception as ex:
+            print(f"（沒有匯出圖片：{ex}。改用 check_bounds.py 估算）")
+    issues += [f"PowerPoint 實際排版：{m}" for m in png_issues]
+    print()
+    for m in notes:
+        print("說明 " + m)
+    for m in issues:
+        print("問題 " + m)
+    print()
+    if issues:
+        print(f"結果：還有 {len(issues)} 個問題。改 plan.json（版型、欄數、側欄、標題）後重跑；"
+              "程式判斷錯的頁面可以用 kind=custom 自己寫那一頁。不要帶著問題交付。")
+    else:
+        print("結果：自動檢查全部通過。看總覽圖確認版面後就可以交付；回報時附上上面的「說明」。")
+    return issues
+
+
+PLAN = {}
+
+
+def main():
+    global PLAN
+    ap = argparse.ArgumentParser(description="來源簡報自動套範本")
+    ap.add_argument("src"); ap.add_argument("tpl"); ap.add_argument("out")
+    ap.add_argument("--plan", help="照這個計畫產生（預設：重新分析）")
+    ap.add_argument("--work", help="工作資料夾（預設：輸出檔旁的 _work）")
+    ap.add_argument("--no-png", action="store_true", help="不匯出圖片")
+    a = ap.parse_args()
+    work = a.work or os.path.join(os.path.dirname(os.path.abspath(a.out)), "_work")
+    os.makedirs(work, exist_ok=True)
+    for p in (a.src, a.tpl):
+        if not os.path.exists(p):
+            sys.exit(f"找不到檔案：{p}")
+    if os.path.abspath(a.out) in (os.path.abspath(a.src), os.path.abspath(a.tpl)):
+        sys.exit("輸出檔不可以和來源或範本同名（不要覆蓋原始檔）")
+    src, prs = H.init(a.src, a.tpl)
+    if a.plan:
+        PLAN = json.load(open(a.plan, encoding="utf-8"))
+        print(f"使用計畫：{a.plan}")
+    else:
+        PLAN = make_plan(src)
+        pp = os.path.join(work, "plan.json")
+        with open(pp, "w", encoding="utf-8") as f:
+            json.dump(PLAN, f, ensure_ascii=False, indent=1)
+        print(f"已寫出頁面計畫：{pp}")
+    print("頁面計畫：")
+    for e in PLAN["pages"]:
+        extra = "".join(f" {k}={e[k]}" for k in ("title", "subtitle", "cols", "side") if e.get(k))
+        print(f"  來源第 {e['src']:>2} 頁 → {e['kind']}{extra}")
+    notes = []
+    for e in PLAN["pages"]:
+        if e.get("kind") not in KINDS:
+            sys.exit(f"plan.json 第 {e.get('src')} 頁的 kind「{e.get('kind')}」不認得，可用：{', '.join(KINDS)}")
+        try:
+            render_page(e, notes)
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            sys.exit(f"產生來源第 {e.get('src')} 頁時出錯：{ex}。在 plan.json 把這頁改成別的 kind（或 custom）再試")
+    for sid in H.orig_ids:
+        H.prs.part.drop_rel(sid.rId)
+        H.prs.slides._sldIdLst.remove(sid)
+    H.prs.save(a.out)
+    print(f"已輸出：{os.path.abspath(a.out)}（{len(H.prs.slides)} 頁）")
+    report(src, a.out, notes, not a.no_png, work)
+
+
+if __name__ == "__main__":
+    main()

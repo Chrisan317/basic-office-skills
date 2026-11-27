@@ -419,12 +419,17 @@ def src_title(slide_no):
                         and min(l + w, b[1] + b[3]) - max(l, b[1]) > 0.1 for b in boxes)
             if not below:
                 out.append((size(sh_), ln[0]))
+    if not out:  # 都不像標題時：上方 1 吋內、字最大（20pt 以上）的單行字當標題
+        top = [(size(sh_), ln[0]) for sh_, l, t, w, h, ln in boxes if t < 1.0 and len(ln) == 1 and size(sh_) >= 20]
+        if top:
+            out.append(max(top))
     out.sort(key=lambda x: -x[0])  # 字最大的排第一個
     return [t for _, t in out]
 
 
-def src_cards(slide_no):
-    """把來源頁散放的文字框，依位置分成 [(小標, [內容行...]), ...]，可以直接 card_grid(s, src_cards(N))。
+def src_cards(slide_no, pos=False):
+    """pos=True 時每張卡片回傳 dict(head, items, l, t, r, b)（吋，卡片和內容的外框）。
+    把來源頁散放的文字框，依位置分成 [(小標, [內容行...]), ...]，可以直接 card_grid(s, src_cards(N))。
     小標＝短的單行（或兩行）文字框，內容＝它下方、左右重疊的文字框。依「上→下、同一列左→右」排序。
     沒有小標的內容，小標是 ""；只有小標沒有內容的，內容是 []。標題（src_title）不包含在內。
     適合：並排的卡片、左右兩欄、「日期＋說明」這類來源頁。不要把整頁 src_paras() 倒成一串清單。"""
@@ -440,26 +445,35 @@ def src_cards(slide_no):
         rec = dict(l=l, t=t, r=l + w, b=t + h, lines=ln)
         (heads if len(ln) <= 2 and sum(len(x) for x in ln) <= 20 and h <= 0.9 else bodies).append(rec)
     # 只有一行的短字，如果正上方 1.2 吋內有另一個小標，是那個小標的內容（例如小標下的「無」）
+    def ratio(a, b):  # 左右重疊佔較窄那個的比例
+        ov = min(a["r"], b["r"]) - max(a["l"], b["l"])
+        return ov / max(min(a["r"] - a["l"], b["r"] - b["l"]), 0.01)
     heads.sort(key=lambda r: r["t"])
     for hd in list(heads):
         above = [o for o in heads if o is not hd and 0 < hd["t"] - o["t"] <= 1.2 and len(hd["lines"]) == 1
-                 and min(o["r"], hd["r"]) - max(o["l"], hd["l"]) > 0.1]
+                 and ratio(o, hd) >= 0.3]
         if above and not any(b["t"] > max(a["t"] for a in above) and b["t"] < hd["t"] for b in bodies):
             heads.remove(hd); bodies.append(hd)
     cards = [dict(head=hd, items=[]) for hd in heads]
     orphans = []
     for bd in sorted(bodies, key=lambda r: r["t"]):
         best = None
-        for c in cards:
-            hd = c["head"]
-            if hd["t"] <= bd["t"] + 0.3 and min(hd["r"], bd["r"]) - max(hd["l"], bd["l"]) > -0.2:
-                d = bd["t"] - hd["t"]
-                if best is None or d < best[0]:
-                    best = (d, c)
+        # 先找左右重疊 30% 以上、在上方最近的小標；沒有才放寬到「幾乎相鄰」
+        for need in (0.3, None):
+            for c in cards:
+                hd = c["head"]
+                ok = ratio(hd, bd) >= need if need else min(hd["r"], bd["r"]) - max(hd["l"], bd["l"]) > -0.2
+                if hd["t"] <= bd["t"] + 0.3 and ok:
+                    d = bd["t"] - hd["t"]
+                    if best is None or d < best[0]:
+                        best = (d, c)
+            if best:
+                break
         if best:
             best[1]["items"] += bd["lines"]
+            best[1].setdefault("parts", []).append(bd)
         else:
-            orphans.append(dict(head=dict(l=bd["l"], t=bd["t"], lines=[]), items=bd["lines"]))
+            orphans.append(dict(head=dict(l=bd["l"], t=bd["t"], r=bd["r"], b=bd["b"], lines=[]), items=bd["lines"]))
     allc = cards + orphans
     allc.sort(key=lambda c: c["head"]["t"])
     rows = []
@@ -468,7 +482,16 @@ def src_cards(slide_no):
             rows[-1].append(c)
         else:
             rows.append([c])
-    return [(" ".join(c["head"]["lines"]), c["items"]) for r in rows for c in sorted(r, key=lambda c: c["head"]["l"])]
+    out = [c for r in rows for c in sorted(r, key=lambda c: c["head"]["l"])]
+    if pos:
+        res = []
+        for c in out:
+            boxes = [c["head"]] + c.get("parts", [])
+            res.append(dict(head=" ".join(c["head"]["lines"]), items=c["items"],
+                            l=min(x["l"] for x in boxes), t=min(x["t"] for x in boxes),
+                            r=max(x["r"] for x in boxes), b=max(x["b"] for x in boxes)))
+        return res
+    return [(" ".join(c["head"]["lines"]), c["items"]) for c in out]
 
 
 def src_tables(slide_no):
@@ -552,6 +575,9 @@ def moved_text(src_pres, out_pres):
                 continue
             for k, b in enumerate(out_b):
                 if tok in b:
+                    o = owner[k]
+                    if o is not None and any(tok in t2 for t2 in src_t[o]):
+                        break  # 是那頁來源本來就有的長詞的一部分（例如「延後」在「延後原因」裡）
                     where.setdefault(k, []).append(tok)
                     break
         for k, toks in where.items():
@@ -1234,10 +1260,14 @@ def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None
     for i, (ttl, items) in enumerate(cards):
         cx, cy = x + (i % cols) * (cw + gap), y + (i // cols) * (ch + gap)
         box(s, cx, cy, cw, ch, CLOUD)
-        txt(s, cx + 0.2, cy + 0.12, cw - 0.4, 0.45, [dict(text=ttl, size=title_size, bold=True, color=BLUE)])
+        top = 0.65
+        if ttl:
+            txt(s, cx + 0.2, cy + 0.12, cw - 0.4, 0.45, [dict(text=ttl, size=title_size, bold=True, color=BLUE)])
+        else:
+            top = 0.2  # 沒有小標：內容從上面開始，不留空白
         paras = build(items, bs)
         if paras:
-            txt(s, cx + 0.2, cy + 0.65, cw - 0.4, ch - 0.75, paras)
+            txt(s, cx + 0.2, cy + top, cw - 0.4, ch - top - 0.1, paras)
         else:
             warn.append(f"card_grid 卡片「{ttl}」沒有內容：檢查解析程式")
         out.append((cx, cy, cw, ch))
