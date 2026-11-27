@@ -273,7 +273,8 @@ def build_flow(s, e, blocks, area):
             y, _ = place_table(s, b["tb"], x, y, w, choice[0], choice[1])
             y += gap
     if tables and choice and choice[0] < 10:
-        e.setdefault("_notes", []).append(f"表格用 {choice[0]}pt 才放得進一頁，請使用者確認字會不會太小")
+        e.setdefault("_notes", []).append(f"輸出第 {len(H.prs.slides) - len(H.orig_ids)} 頁（來源第 {e.get('src')} 頁）的表格用 {choice[0]}pt "
+                                          "才放得進一頁，請使用者確認字會不會太小")
 
 
 def side_panel(s, cards, x, y, w, h):
