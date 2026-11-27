@@ -21,6 +21,30 @@
 
 ## 安裝
 
+### 一行安裝（Windows）
+
+在 PowerShell 執行（裝到 OpenCode）：
+
+```powershell
+irm https://raw.githubusercontent.com/Chrisan317/basic-office-skills/main/install.ps1 | iex
+```
+
+裝到 Claude Code：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Chrisan317/basic-office-skills/main/install.ps1))) -Agent claude
+```
+
+安裝腳本會：
+- 把每個技能複製到 agent 的技能資料夾，只覆蓋同名技能，其他技能保留（目標是 git repo 的技能會略過）
+- 全域規則（OpenCode 的 `AGENTS.md`、Claude Code 的 `CLAUDE.md`）用標記區塊加入：原本的內容保留，重複安裝只更新這個區塊，改動前備份成 `.bak`
+- 安裝需要的 Python 套件（加 `-NoPip` 可略過）
+
+更新到新版時重新執行同一行即可。也可以叫 agent 幫你裝：「執行 `irm https://raw.githubusercontent.com/Chrisan317/basic-office-skills/main/install.ps1 | iex` 安裝技能包」。
+已下載整個 repo 時，可以在資料夾裡執行 `powershell -ExecutionPolicy Bypass -File install.ps1`。
+
+### 手動安裝
+
 把 `skills` 裡的資料夾複製到你的 agent 讀取技能的位置，`AGENTS.md` 放到全域規則的位置：
 
 | Agent | 技能放這裡 | 全域規則 |
