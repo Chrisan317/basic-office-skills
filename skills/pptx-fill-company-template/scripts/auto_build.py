@@ -105,6 +105,9 @@ def pictures(n):
             continue
         if l < -0.2 or t < -0.2 or l + w > W + 0.2 or t + h > Hh + 0.2:  # 超出投影片邊緣的多半是裝飾圖
             continue
+        edges = sum([l < 0.05, t < 0.05, l + w > W - 0.05, t + h > Hh - 0.05])
+        if edges >= 2:  # 貼著投影片角落的圖多半是裝飾
+            continue
         out.append(dict(sh=sh, l=l, t=t, w=w, h=h))
     out.sort(key=lambda p: (round(p["t"], 1), p["l"]))
     return out
@@ -155,6 +158,41 @@ def is_graphic(sl):
     return conn >= 1 or text_shapes >= 3 or text_ph >= 4
 
 
+def inherited_size(s, ph):
+    """預留位置繼承的字級（pt）：先看版面的預留位置，再看母片的標題樣式。找不到回傳 None。"""
+    try:
+        idx = ph.placeholder_format.idx
+        lay_ph = next((x for x in s.slide_layout.placeholders if x.placeholder_format.idx == idx), None)
+        for el in ([lay_ph._element] if lay_ph is not None else []):
+            for tag in ("a:defRPr", "a:rPr", "a:endParaRPr"):
+                for r in el.iter(H.qn(tag)):
+                    if r.get("sz"):
+                        return int(r.get("sz")) / 100
+        master = s.slide_layout.slide_master._element
+        for st in master.iter(H.qn("p:titleStyle")):
+            for r in st.iter(H.qn("a:defRPr")):
+                if r.get("sz"):
+                    return int(r.get("sz")) / 100
+    except Exception:
+        pass
+    return None
+
+
+def fit_text(ph, text, size0):
+    """預留位置放不下時把字縮小（最小 18pt）：用寬度算行數、用高度檢查。放得下就不動，保留範本原本的字級。"""
+    w, h = ph.width / H.EMU - 0.2, ph.height / H.EMU
+    size = size0
+    while size > 18:
+        lines = max(1, math.ceil(H.text_w(text, size) * 1.08 / max(w * 72, 1)))
+        if lines * size * 1.2 / 72 <= h + 0.05:
+            break
+        size -= 2
+    if size < size0:
+        for p_ in ph.text_frame.paragraphs:
+            for r_ in p_.runs:
+                r_.font.size = Pt(size)
+
+
 def _set_xfrm(el, x, y, w, h):
     """直接改 XML 的位置大小（適用一般圖形、群組、圖片、表格框）。沒有 xfrm（原本繼承版面）就補一個。"""
     from lxml import etree
@@ -198,6 +236,8 @@ def copy_graphic(s, sl, area):
             continue
         if sh.left is None or sh.width is None:
             continue
+        if sh.has_text_frame and not sh.text_frame.text.strip() and (sh.is_placeholder or sh.shape_type == 17):
+            continue  # 空的預留位置、空文字框（會把範圍撐大）
         picks.append(sh)
     if not picks:
         return
@@ -342,7 +382,7 @@ def header_rows(tb):
 def est_table_h(rows, size, w, compact):
     widths = H.col_widths(rows, size, w)
     pad, ln = (0.02, 1.2) if compact else (0.04, H.LINE)
-    min_h = size * ln / 72 + (0.02 if compact else 0.05)
+    min_h = size * H.SCALE * ln / 72 + (0.02 if compact else 0.05)
     return sum(H.row_height(r, widths, size, min_h, pad, ln) for r in rows), widths
 
 
@@ -352,7 +392,7 @@ def place_table(s, src_tb, x, y, w, size, compact, bold_last=False):
     rows = [(list(r) + [""] * ncol)[:ncol] for r in rows]
     total_h, widths = est_table_h(rows, size, w, compact)
     pad, ln = (0.02, 1.2) if compact else (0.04, H.LINE)
-    min_h = size * ln / 72 + (0.02 if compact else 0.05)
+    min_h = size * H.SCALE * ln / 72 + (0.02 if compact else 0.05)
     hs = [H.row_height(r, widths, size, min_h, pad, ln) for r in rows]
     nh = header_rows(src_tb)
     body = rows[nh:]
@@ -416,12 +456,12 @@ def build_flow(s, e, blocks, area):
     fixed, tables = 0.0, []
     for b in blocks:
         if b["type"] == "stats":
-            b["h"] = 1.05
+            b["h"] = 1.05 * H.SCALE
         elif b["type"] == "text":
             b["size"] = 12
             b["h"] = H.est_h([(p["text"], p["size"], p["after"]) for p in text_paras(b["lines"], 12, b.get("head"))], w - 0.1) + 0.1
         elif b["type"] == "pairs":
-            b["h"] = 0.3 * (len(b["rows"]) + 1) + (0.35 if b.get("caption") else 0)
+            b["h"] = (0.3 * (len(b["rows"]) + 1) + (0.35 if b.get("caption") else 0)) * H.SCALE
         if b["type"] != "table":
             fixed += b["h"] + gap
         else:
@@ -429,7 +469,8 @@ def build_flow(s, e, blocks, area):
     budget = h - fixed - gap * len(tables)
     # 表格字級：所有表格用同一個字級，從 12pt 往下試，放不下再用緊湊列高，最小 8pt
     choice = None
-    for size, compact in [(12, False), (11, False), (10, False), (10, True), (9, True), (8.5, True), (8, True)]:
+    for size, compact in [(12, False), (11, False), (10, False), (10, True), (9, True), (8.5, True), (8, True),
+                          (7.5, True), (7, True)]:
         need = sum(est_table_h(table_rows(b["tb"]), size, w, compact)[0] for b in tables)
         choice = (size, compact)
         if need <= budget:
@@ -443,8 +484,8 @@ def build_flow(s, e, blocks, area):
             y += b["h"] + gap
         elif b["type"] == "pairs":
             if b.get("caption"):
-                H.txt(s, x, y, w, 0.32, [dict(text=b["caption"], size=13, bold=True, color=H.NAVY)])
-                y += 0.35
+                H.txt(s, x, y, w, 0.34 * H.SCALE, [dict(text=b["caption"], size=13, bold=True, color=H.NAVY)])
+                y += 0.37 * H.SCALE
             rows = [b["header"]] + b["rows"]
             _, y2 = H.put_table(s, rows, x, y, min(w, 1.6 * len(b["header"]) + 0.5), size=11, name="數字表")
             y = y2 + gap
@@ -566,13 +607,8 @@ def render_page(e, notes):
         others = [r for r in rest if r not in dates]
         s = H.new_slide("cover", title)
         t_ = s.shapes.title
-        if t_ is not None and t_.width:
-            tw_ = t_.width / H.EMU - 0.3
-            size_ = min(54, 2 * tw_ * 72 / max(H.text_w(title, 1), 1))  # 最多兩行
-            if H.text_w(title, 54) > tw_ * 72:
-                for p_ in t_.text_frame.paragraphs:
-                    for r_ in p_.runs:
-                        r_.font.size = Pt(max(24, int(size_)))
+        if t_ is not None and t_.width and t_.height:
+            fit_text(t_, title, inherited_size(s, t_) or 44)
         from pptx.enum.shapes import PP_PLACEHOLDER as P
         nsub = len([ph for ph in s.placeholders if ph.placeholder_format.type in (P.SUBTITLE, P.BODY)])
         sub, date = e.get("subtitle", "　".join(others)), e.get("date", "　".join(dates))
@@ -594,7 +630,7 @@ def render_page(e, notes):
             if size < 24:
                 for p_ in ph.text_frame.paragraphs:
                     for r_ in p_.runs:
-                        r_.font.size = Pt(size)
+                        r_.font.size = Pt(size * H.SCALE)
         return
     if kind == "closing":
         lines = H.src_title(n) + [x for c in H.src_cards(n) for x in ([c[0]] if c[0] else []) + c[1]]

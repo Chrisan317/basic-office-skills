@@ -144,6 +144,7 @@ src = None          # source deck (content is read from here)
 prs = None          # output deck, opened from the template
 L = {}              # template layout name -> layout
 orig_ids = []       # template sample slides, removed by save()
+SCALE = 1.0         # 字級倍率＝投影片高度 / 7.5 吋（小範本字小一點、大範本字大一點）
 BOILER = set()      # 來源很多頁都有的同一行字（頁尾、版權、公司標語），不當內容
 TPL_PATH = None     # template path (structure_check 用：範本本來就有的字不算自己加的)
 warn = []           # overflow warnings collected by txt()
@@ -160,6 +161,8 @@ def init(src_path, tpl_path, theme=True):
     src = Presentation(src_path) if src_path else None
     _compute_boiler(src)
     prs = Presentation(tpl_path)
+    global SCALE
+    SCALE = max(0.7, min(1.6, prs.slide_height / 914400 / 7.5))
     # 就地更新（不要重新指定）：`from helpers import *` 拿到的 L、orig_ids 才不會是空的舊物件
     orig_ids[:] = list(prs.slides._sldIdLst)
     L.clear(); L.update({l.name: l for l in prs.slide_layouts})
@@ -273,15 +276,16 @@ def _items(shapes, from_layout=False, slide_area=None):
                 ((sh_.left or 0) + (sh_.width or 0)) / EMU, ((sh_.top or 0) + (sh_.height or 0)) / EMU)
         if slide_area and (box_[2] - box_[0]) * (box_[3] - box_[1]) > slide_area * 0.4:
             continue  # 背景圖
+        ph = (not from_layout) and (sh_.is_placeholder or sh_.name in ("Title", "Subtitle"))  # 標題、副標
         if getattr(sh_, "has_table", False) and sh_.has_table:
-            out.append(("表格", box_, from_layout))
+            out.append(("表格", box_, from_layout, ph))
         elif getattr(sh_, "has_chart", False) and sh_.has_chart:
-            out.append(("圖表", box_, from_layout))
+            out.append(("圖表", box_, from_layout, ph))
         elif sh_.shape_type == 13:  # picture
-            out.append(("範本圖片" if from_layout else "圖片", box_, from_layout))
+            out.append(("範本圖片" if from_layout else "圖片", box_, from_layout, ph))
         elif sh_.has_text_frame and sh_.text_frame.text.strip():
             label = norm(sh_.text_frame.text)[:14]
-            out.append((("範本文字「%s」" if from_layout else "「%s」") % label, _text_rect(sh_), from_layout))
+            out.append((("範本文字「%s」" if from_layout else "「%s」") % label, _text_rect(sh_), from_layout, ph))
     return out
 
 
@@ -293,14 +297,16 @@ def overlap_check(pres):
     for no, sl in enumerate(pres.slides, 1):
         its = _items(sl.shapes)
         its += _items(sl.slide_layout.shapes, True, W * H)
-        for name, (l, t, r, b), tpl in its:
+        for name, (l, t, r, b), tpl, _ in its:
             if not tpl and (r > W + 0.05 or b > H + 0.05 or l < -0.05 or t < -0.05):
                 msgs.append(f"第 {no} 頁：{name} 超出投影片（右 {r:.2f}/{W:.2f}、下 {b:.2f}/{H:.2f}）")
         for i in range(len(its)):
             for j in range(i + 1, len(its)):
-                (n1, a, t1), (n2, b_, t2) = its[i], its[j]
+                (n1, a, t1, p1), (n2, b_, t2, p2) = its[i], its[j]
                 if t1 and t2:
                     continue
+                if (t1 and p2) or (t2 and p1):
+                    continue  # 範本的標題位置本來就設計在範本圖案上
                 ow = min(a[2], b_[2]) - max(a[0], b_[0])
                 oh = min(a[3], b_[3]) - max(a[1], b_[1])
                 if ow > 0.12 and oh > 0.1:
@@ -740,8 +746,9 @@ def est_h(paras, w_in):
     """paras: list of (text,size,space_after_pt)"""
     h = 0
     for t, sz, sa in paras:
+        sz = sz * SCALE
         lines = max(1, math.ceil(text_w(t, sz) / max(w_in * 72, 1)))
-        h += lines * sz * 1.25 + sa
+        h += lines * sz * 1.25 + sa * SCALE
     return h / 72
 
 KIND_NAMES = {
@@ -750,7 +757,7 @@ KIND_NAMES = {
     "section": ["Section Header", "區段標題", "章節標題"],
     "closing": ["Closing", "Closing Slide", "Closing Slide_Dark", "End", "Thank You", "結尾", "謝謝"],
 }
-_KIND_WORDS = {"cover": ("cover", "title slide", "封面"), "section": ("section", "區段", "章節"),
+_KIND_WORDS = {"cover": ("cover", "title slide", "封面"), "section": ("section", "secton", "區段", "章節", "구역"),
                "closing": ("closing", "end", "thank", "結尾", "謝謝")}
 
 
@@ -772,11 +779,21 @@ def find_layout(kind):
     if kind == "cover":
         return next((l for l in lays if P.CENTER_TITLE in _ph_types(l)), lays[0])
     if kind == "content":
-        title_only = [l for l in lays if P.TITLE in _ph_types(l)
-                      and not (set(_ph_types(l)) - deco - {P.TITLE})]
+        Hh = prs.slide_height / 914400
+
+        def top_title(l):  # 標題在上方 1/4（置中大標題的版面不適合放內容）
+            return any(ph.placeholder_format.type in (P.TITLE, P.CENTER_TITLE) and ph.top is not None
+                       and ph.top / 914400 < Hh * 0.25 for ph in l.placeholders)
+        title_only = [l for l in lays if top_title(l) and not (set(_ph_types(l)) - deco - {P.TITLE, P.CENTER_TITLE})]
         if title_only:
             return title_only[0]
-        return next((l for l in lays if P.TITLE in _ph_types(l)), lays[min(1, len(lays) - 1)])
+        with_body = [l for l in lays if top_title(l) and P.PICTURE not in _ph_types(l)]
+        if with_body:
+            return min(with_body, key=lambda l: len(l.placeholders))
+        blank = [l for l in lays if not (set(_ph_types(l)) - deco)]  # 沒有合適的就用空白版面，標題自己加
+        if blank:
+            return blank[0]
+        return lays[min(1, len(lays) - 1)]
     return None  # section / closing：範本沒有就不做
 
 
@@ -796,6 +813,10 @@ def new_slide(layout, title=None):
     s = prs.slides.add_slide(lay)
     if title is not None and s.shapes.title is not None:
         s.shapes.title.text = title
+    elif title and layout in ("content", "section"):  # 版面沒有標題位置：自己加一個標題文字框
+        W, Hh = slide_size()
+        txt(s, 0.5 * Hh / 7.5, 0.3 * Hh / 7.5, W - Hh / 7.5, 0.8 * Hh / 7.5,
+            [dict(text=title, size=28, bold=True, color=NAVY)], name="Title")
     return s
 
 
@@ -812,11 +833,11 @@ def set_subtitle(s, text, nth=0, align=None, pos=None):
                   if ph.placeholder_format.type in (P.SUBTITLE, P.BODY) and ph.has_text_frame],
                  key=lambda ph: ph.placeholder_format.idx)
     if nth >= len(phs):
-        t = s.shapes.title
+        t = s.shapes.title or next((x for x in s.shapes if x.name == "Title" and not x.is_placeholder), None)
         if nth == 0 and t is not None and t.top is not None:  # 內容頁：在標題下方補一個文字框
             W, _ = slide_size()
             x0, y0 = t.left / 914400, (t.top + t.height) / 914400
-            x0, y0, w0, h0 = pos or (x0, y0, W - x0 - 0.5, 0.45)
+            x0, y0, w0, h0 = pos or (x0, y0, W - x0 - 0.5, 0.48 * SCALE)
             print(f"set_subtitle：版面「{s.slide_layout.name}」沒有副標預留位置，改在標題下方加文字框")
             return txt(s, x0, y0, w0, h0, [dict(text=text, size=16, bold=True, color=BLUE)],
                        align=align or PP_ALIGN.LEFT, name="Subtitle")
@@ -828,7 +849,7 @@ def set_subtitle(s, text, nth=0, align=None, pos=None):
     is_content = t is not None and t.placeholder_format.type == P.TITLE
     if pos is None and is_content and ph.top is not None and ph.top / 914400 < H * 0.3             and ph.height / 914400 < 1.0 and t.top is not None:
         tb = (t.top + t.height) / 914400
-        pos = (t.left / 914400, tb, W - t.left / 914400 - 0.5, 0.45)
+        pos = (t.left / 914400, tb, W - t.left / 914400 - 0.5, 0.48 * SCALE)
         if align is None:
             align = PP_ALIGN.LEFT
     if pos:
@@ -863,8 +884,8 @@ def content_area(s=None, margin=0.5, bottom=0.45):
                 continue
             if ph.top / 914400 < H * 0.3 and ph.height / 914400 < 1.0:
                 top = max(top, (ph.top + ph.height) / 914400 + 0.15)
-        for sh_ in s.shapes:  # set_subtitle 補的副標文字框
-            if sh_.name == "Subtitle" and not sh_.is_placeholder:
+        for sh_ in s.shapes:  # set_subtitle 補的副標文字框、new_slide 補的標題文字框
+            if sh_.name in ("Subtitle", "Title") and not sh_.is_placeholder:
                 top = max(top, (sh_.top + sh_.height) / 914400 + 0.15)
     return margin, top, W - 2 * margin, H - top - bottom
 
@@ -889,12 +910,12 @@ def txt(s, x, y, w, h, paras, anchor=MSO_ANCHOR.TOP, align=PP_ALIGN.LEFT, margin
     for i, p in enumerate(paras):
         para = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         para.alignment = p.get("align", align)
-        para.space_after = Pt(p.get("after", 0))
+        para.space_after = Pt(p.get("after", 0) * SCALE)
         runs = p.get("runs") or [dict(text=p["text"])]
         full = ""
         for r in runs:
             run = para.add_run(); run.text = r["text"]; full += r["text"]
-            f = run.font; f.size = Pt(r.get("size", p.get("size", 14)))
+            f = run.font; f.size = Pt(round(r.get("size", p.get("size", 14)) * SCALE, 1))
             f.bold = r.get("bold", p.get("bold", False))
             f.color.rgb = rgb(r.get("color", p.get("color", BLACK)))
         est.append((full, p.get("size", 14), p.get("after", 0)))
@@ -930,11 +951,11 @@ def cell_set(cell, text, size, bold=False, color=BLACK, fill=None, align=PP_ALIG
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.alignment = align
         r = p.add_run(); r.text = ln
-        r.font.size = Pt(size); r.font.bold = bold; r.font.color.rgb = rgb(color)
+        r.font.size = Pt(round(size * SCALE, 1)); r.font.bold = bold; r.font.color.rgb = rgb(color)
         if not ln:  # empty run: size lives on endParaRPr, otherwise the row grows to 18pt
             p._p.remove(r._r)
         for e in p._p.findall(qn("a:endParaRPr")): p._p.remove(e)
-        etree.SubElement(p._p, qn("a:endParaRPr"), lang="zh-TW", sz=str(int(size * 100)))
+        etree.SubElement(p._p, qn("a:endParaRPr"), lang="zh-TW", sz=str(int(size * SCALE * 100)))
     cell.margin_left = cell.margin_right = Inches(ml)
     cell.margin_top = cell.margin_bottom = Inches(mt)
     cell.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -1041,7 +1062,7 @@ def lines_needed(text, size, w_in):
     """一段文字在寬 w_in 吋、字級 size 時大約幾行（會算換行字元，並預留斷字的浪費）。"""
     n = 0
     for part in str(text).split("\n"):
-        n += max(1, math.ceil(text_w(part, size) * 1.08 / max(w_in * 72, 1)))
+        n += max(1, math.ceil(text_w(part, size * SCALE) * 1.08 / max(w_in * 72, 1)))
     return n
 
 
@@ -1051,14 +1072,14 @@ def row_height(cells, widths, size, min_h=0.3, pad=0.1, line=LINE):
     for v, w in zip(cells, widths):
         parts = v if isinstance(v, list) else [v]
         n = max(n, sum(lines_needed(p, size, w - 0.14) for p in parts) if parts else 1)
-    return max(min_h, n * size * line / 72 + pad)
+    return max(min_h, n * size * SCALE * line / 72 + pad)
 
 
 def col_widths(rows, size, total, min_w=0.6, max_w=5.0):
     """依內容長度分配欄寬，總寬 total 吋。"""
     def flat(v): return " ".join(v) if isinstance(v, list) else str(v)
     ncol = max(len(r) for r in rows)
-    w = [max(min_w, min(max(text_w(flat(r[c]), size) for r in rows if c < len(r)) / 72 + 0.3, max_w))
+    w = [max(min_w, min(max(text_w(flat(r[c]), size * SCALE) for r in rows if c < len(r)) / 72 + 0.3, max_w))
          for c in range(ncol)]
     return fit(w, total)
 
@@ -1119,7 +1140,7 @@ def table_pages(title, rows, first=None, top=None, sizes=(16, 14, 12, 11, 10), w
         w = widths or col_widths(rows, size, cw)
         # compact：儲存格上下邊界 0.01 吋、行高用 1.2 倍（PowerPoint 小字的實際行高）
         pad, ln = (0.02, 1.2) if compact else (0.1, LINE)
-        min_h = size * ln / 72 + (0.02 if compact else 0.12)
+        min_h = size * SCALE * ln / 72 + (0.02 if compact else 0.12)
         hh = row_height(head, w, size, min_h, pad, ln) + (0 if compact else 0.04)
         bh = [row_height(r, w, size, min_h, pad, ln) for r in body]
         pages = paginate(bh, [avail1 - hh, avail - hh])
@@ -1190,7 +1211,7 @@ def put_table(s, rows, x, y, w, size=11, widths=None, aligns=None, bold_last=Fal
     rows = [(list(r) + [""] * ncol)[:ncol] for r in rows]
     w_ = widths and fit(widths, w) or col_widths(rows, size, w)
     pad = 0.04 if compact else 0.1
-    min_h = size * LINE / 72 + (0.05 if compact else 0.12)
+    min_h = size * SCALE * LINE / 72 + (0.05 if compact else 0.12)
     hs = [row_height(r, w_, size, min_h, pad) for r in rows]
     body = rows[1:] if header else rows
     if aligns is None:
@@ -1239,14 +1260,14 @@ def stat_cards(s, items, x=None, y=None, w=None, h=1.4, gap=0.25, value_size=36)
                         "可能把兩行解析成一個值：用 src_paras() 一行一行讀")
         cx = x + i * (cw + gap)
         box(s, cx, y, cw, h, CLOUD)
-        txt(s, cx + 0.15, y + 0.08, cw - 0.3, 0.4, [dict(text=str(lab), size=14, color=GRAY)])
+        txt(s, cx + 0.15, y + 0.08 * SCALE, cw - 0.3, 0.42 * SCALE, [dict(text=str(lab), size=14, color=GRAY)])
         vs = value_size
-        while vs > 18 and text_w(str(val), vs) + text_w(" " + str(unit), 16) > (cw - 0.4) * 72:
+        while vs > 18 and text_w(str(val), vs * SCALE) + text_w(" " + str(unit), 16 * SCALE) > (cw - 0.4) * 72:
             vs -= 2
         runs = [dict(text=str(val), size=vs, bold=True, color=BLUE)]
         if unit:
             runs.append(dict(text=" " + str(unit), size=16, color=GRAY))
-        txt(s, cx + 0.15, y + 0.45, cw - 0.3, h - 0.5, [dict(runs=runs, size=vs)])
+        txt(s, cx + 0.15, y + 0.45 * SCALE, cw - 0.3, max(h - 0.5 * SCALE, vs * SCALE * 1.3 / 72 + 0.06), [dict(runs=runs, size=vs)])
     return y + h
 
 
@@ -1263,9 +1284,10 @@ def agenda(s, items, gap=0.25):
         cx, cy = x + (i % cols) * (cw + gap), y0 + (i // cols) * (ch + gap)
         box(s, cx, cy, cw, ch, CLOUD)
         ns = 54 if ch >= 2.5 else 36
-        txt(s, cx + 0.2, cy + 0.25, cw - 0.4, ns / 72 * 1.3 + 0.1, [dict(text=f"{i + 1:02d}", size=ns, bold=True, color=BLUE)])
+        txt(s, cx + 0.2, cy + 0.25, cw - 0.4, ns * SCALE / 72 * 1.3 + 0.1, [dict(text=f"{i + 1:02d}", size=ns, bold=True, color=BLUE)])
         size = 28 if cw >= 2.5 else 20
-        while size > 14 and lines_needed(it, size, cw - 0.5) > 2:
+        while size > 11 and (lines_needed(it, size, cw - 0.5) > 2 or
+                             est_h([(it, size, 0)], cw - 0.5) + 0.06 > ch * 0.4):
             size -= 2
         txt(s, cx + 0.2, cy + ch * 0.56, cw - 0.4, ch * 0.4, [dict(text=it, size=size, bold=True, color=NAVY)])
 
@@ -1307,7 +1329,7 @@ def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None
             ts = title_size  # 小標太長：先縮字，再依行數加高
             while ts > 12 and lines_needed(ttl, ts, cw - 0.5) > 2:
                 ts -= 2
-            th = lines_needed(ttl, ts, cw - 0.5) * ts * 1.3 / 72 + 0.1
+            th = lines_needed(ttl, ts, cw - 0.5) * ts * SCALE * 1.3 / 72 + 0.1
             txt(s, cx + 0.2, cy + 0.12, cw - 0.4, th, [dict(text=ttl, size=ts, bold=True, color=BLUE)])
             top = 0.12 + th + 0.08
         else:
@@ -1354,7 +1376,7 @@ def column_chart(s, categories, bars, line=None, area=None, colors=None, labels=
     if ch.has_legend:
         ch.legend.position = XL_LEGEND_POSITION.TOP
         ch.legend.include_in_layout = False
-        ch.legend.font.size = Pt(12)
+        ch.legend.font.size = Pt(12 * SCALE)
     pal = colors or ([CYAN, ICE, NAVY, GRAY] if line else [BLUE, ICE, CYAN, NAVY, GRAY])
     for se, col in zip(list(ch.plots[0].series)[:len(bars)], pal * 3):
         se.format.fill.solid(); se.format.fill.fore_color.rgb = rgb(col)
@@ -1365,20 +1387,20 @@ def column_chart(s, categories, bars, line=None, area=None, colors=None, labels=
     if labels:
         pl.has_data_labels = True
         dl = pl.data_labels
-        dl.font.size = Pt(9)
+        dl.font.size = Pt(9 * SCALE)
         whole = all(abs(v - round(v)) < 1e-9 for v in allv)
         dl.number_format = "#,##0;-#,##0;;" if whole else "#,##0.0;-#,##0.0;;"
         dl.number_format_is_linked = False
         dl.position = XL_LABEL_POSITION.OUTSIDE_END
     ca = ch.category_axis
-    ca.tick_labels.font.size = Pt(10)
+    ca.tick_labels.font.size = Pt(10 * SCALE)
     ca.format.line.color.rgb = rgb(GRAY)
     if len(categories) > 8 or max((text_w(str(c), 10) for c in categories), default=0) > 60:
         txPr = ca._element.find(qn("c:txPr"))
         if txPr is not None:
             txPr.find(qn("a:bodyPr")).set("rot", "-2700000")
     va = ch.value_axis
-    va.tick_labels.font.size = Pt(10)
+    va.tick_labels.font.size = Pt(10 * SCALE)
     va.major_gridlines.format.line.color.rgb = rgb(CLOUD)
     va.format.line.fill.background()
     return ch
