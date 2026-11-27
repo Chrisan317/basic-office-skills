@@ -10,7 +10,10 @@
 文字一律在產生時從來源讀，計畫裡只記「哪一頁、用什麼版型」，所以不會漏字、也不會出現自己編的字。
 """
 import argparse
+import hashlib
+import io
 import json
+import math
 import os
 import re
 import sys
@@ -28,7 +31,7 @@ from pptx.util import Inches, Pt  # noqa: E402
 from pptx.enum.text import PP_ALIGN  # noqa: E402
 
 AGENDA_WORDS = ("agenda", "目錄", "大綱", "outline", "contents", "議程")
-KINDS = ("cover", "agenda", "table", "chart", "text", "closing", "section", "custom", "skip")
+KINDS = ("cover", "agenda", "table", "chart", "text", "graphic", "closing", "section", "custom", "skip")
 
 
 # ---------------------------------------------------------------- 讀來源
@@ -40,7 +43,11 @@ def _all_shapes(shapes, tf=(0.0, 0.0, 1.0, 1.0)):
         l, t = (sh.left or 0) / E, (sh.top or 0) / E
         w, h = (sh.width or 0) / E, (sh.height or 0) / E
         L_, T_, W_, H_ = ox + l * sx, oy + t * sy, w * sx, h * sy
-        if sh.shape_type == 6:
+        try:
+            grp = sh.shape_type == 6
+        except NotImplementedError:
+            grp = False
+        if grp:
             x = sh._element.find(".//" + H.qn("a:chOff")); e = sh._element.find(".//" + H.qn("a:chExt"))
             cx, cy = (int(x.get("x")) / E, int(x.get("y")) / E) if x is not None else (0, 0)
             cw, ch = (int(e.get("cx")) / E, int(e.get("cy")) / E) if e is not None else (w, h)
@@ -58,6 +65,174 @@ def _max_size(sh):
 def _clean(t):
     """去掉前後的裝飾符號（例如「- 名字-」）。"""
     return re.sub(r"^[\s\-–—_~·•]+|[\s\-–—_~·•]+$", "", t)
+
+
+DECOR = set()  # 很多頁都出現的圖（logo、裝飾），不搬
+
+
+def _is_pic(sh):
+    try:
+        return sh.shape_type == 13 or (sh.is_placeholder and hasattr(sh, "image") and sh.image is not None)
+    except Exception:
+        return False
+
+
+def _hash(sh):
+    try:
+        return hashlib.md5(sh.image.blob).hexdigest()
+    except Exception:
+        return None
+
+
+def find_decor(src):
+    """出現在 3 頁以上、且超過 4 成頁面的同一張圖，當成裝飾（logo、底圖）。"""
+    from collections import Counter
+    cnt = Counter()
+    for sl in src.slides:
+        cnt.update({_hash(sh) for sh, *_ in _all_shapes(sl.shapes) if _is_pic(sh)} - {None})
+    n = len(src.slides)
+    DECOR.clear()
+    DECOR.update(k for k, v in cnt.items() if v >= 3 and v >= 0.4 * n)
+
+
+def pictures(n):
+    """來源第 n 頁要搬的圖片：夠大（0.6 平方吋以上）、不是整頁底圖、不是每頁都有的裝飾圖。依位置排序。"""
+    sl = H.src.slides[n - 1]
+    W, Hh = H.src.slide_width / H.EMU, H.src.slide_height / H.EMU
+    out = []
+    for sh, l, t, w, h in _all_shapes(sl.shapes):
+        if not _is_pic(sh) or w * h < 0.6 or w * h > 0.85 * W * Hh or _hash(sh) in DECOR:
+            continue
+        if l < -0.2 or t < -0.2 or l + w > W + 0.2 or t + h > Hh + 0.2:  # 超出投影片邊緣的多半是裝飾圖
+            continue
+        out.append(dict(sh=sh, l=l, t=t, w=w, h=h))
+    out.sort(key=lambda p: (round(p["t"], 1), p["l"]))
+    return out
+
+
+def place_pictures(s, pics, x, y, w, h, gap=0.15):
+    """把圖片排進 (x, y, w, h)：試不同欄數，挑圖片總面積最大的排法；保持比例、保留裁切。"""
+    n = len(pics)
+    best = None
+    for cols in range(1, n + 1):
+        rows = math.ceil(n / cols)
+        cw, ch = (w - gap * (cols - 1)) / cols, (h - gap * (rows - 1)) / rows
+        area = sum(min(cw / p["w"], ch / p["h"]) ** 2 * p["w"] * p["h"] for p in pics)
+        if best is None or area > best[0]:
+            best = (area, cols, rows, cw, ch)
+    _, cols, rows, cw, ch = best
+    bottom = y
+    for i, p in enumerate(pics):
+        k = min(cw / p["w"], ch / p["h"])
+        pw, ph = p["w"] * k, p["h"] * k
+        cx = x + (i % cols) * (cw + gap) + (cw - pw) / 2
+        cy = y + (i // cols) * (ch + gap)
+        sh = p["sh"]
+        pic = s.shapes.add_picture(io.BytesIO(sh.image.blob), Inches(cx), Inches(cy), Inches(pw), Inches(ph))
+        for side in ("crop_left", "crop_right", "crop_top", "crop_bottom"):
+            try:
+                setattr(pic, side, getattr(sh, side))
+            except Exception:
+                pass
+        bottom = max(bottom, cy + ph)
+    return bottom
+
+
+def is_graphic(sl):
+    """圖解頁：有連接線、文字放在圖形裡的流程圖、或用很多文字預留位置排的版面（時間軸等）。
+    這種頁面重排會失去位置關係，所以整組圖形搬過去。"""
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    conn = text_shapes = text_ph = 0
+    for sh, *_ in _all_shapes(sl.shapes):
+        tag = sh.element.tag.rsplit("}", 1)[-1]
+        if tag == "cxnSp":
+            conn += 1
+        elif sh.has_text_frame and sh.text_frame.text.strip():
+            if sh.is_placeholder and sh.placeholder_format.type not in (P.TITLE, P.CENTER_TITLE) + H._SKIP_PH:
+                text_ph += 1
+            elif not sh.is_placeholder and sh.shape_type == 1:  # 文字直接寫在圖形裡
+                text_shapes += 1
+    return conn >= 1 or text_shapes >= 3 or text_ph >= 4
+
+
+def _set_xfrm(el, x, y, w, h):
+    """直接改 XML 的位置大小（適用一般圖形、群組、圖片、表格框）。沒有 xfrm（原本繼承版面）就補一個。"""
+    from lxml import etree
+    xf = None
+    for tag in ("p:spPr", "p:grpSpPr"):
+        pr = el.find(H.qn(tag))
+        if pr is not None:
+            xf = pr.find(H.qn("a:xfrm"))
+            if xf is None:
+                xf = etree.SubElement(pr, H.qn("a:xfrm"))
+                pr.insert(0, xf)
+            break
+    if xf is None:
+        xf = el.find(H.qn("p:xfrm"))
+    if xf is None:
+        return
+    off = xf.find(H.qn("a:off")); ext = xf.find(H.qn("a:ext"))
+    if off is None:
+        off = etree.SubElement(xf, H.qn("a:off")); xf.insert(0, off)
+    if ext is None:
+        ext = etree.SubElement(xf, H.qn("a:ext"))
+    off.set("x", str(x)); off.set("y", str(y)); ext.set("cx", str(w)); ext.set("cy", str(h))
+
+
+def copy_graphic(s, sl, area):
+    """把來源頁的圖形（標題、頁碼、頁尾、裝飾圖以外）照相對位置複製到 area，等比例縮放；圖片一起帶過去。"""
+    import copy as _copy
+    from pptx.enum.shapes import PP_PLACEHOLDER as P
+    E = H.EMU
+    picks = []
+    titles = set(H.src_title(list(H.src.slides).index(sl) + 1))
+    for sh in sl.shapes:
+        if sh.has_text_frame and H.norm(sh.text_frame.text) in {H.norm(t) for t in titles}:
+            continue  # 標題已經放在新投影片的標題
+        if sh.is_placeholder and sh.placeholder_format.type in (P.TITLE, P.CENTER_TITLE) + H._SKIP_PH:
+            continue
+        if _is_pic(sh) and _hash(sh) in DECOR:
+            continue
+        if sh.has_text_frame and all(H._is_noise(x) or x.strip() == "" for x in sh.text_frame.text.split("\n")) \
+                and not sh.text_frame.text.strip() == "" and sh.shape_type != 1:
+            continue
+        if sh.left is None or sh.width is None:
+            continue
+        picks.append(sh)
+    if not picks:
+        return
+    l0 = min(sh.left for sh in picks); t0 = min(sh.top for sh in picks)
+    r0 = max(sh.left + sh.width for sh in picks); b0 = max(sh.top + sh.height for sh in picks)
+    x, y, w, h = area
+    k = min(w * E / max(r0 - l0, 1), h * E / max(b0 - t0, 1), 1.5)
+    ox = x * E + (w * E - (r0 - l0) * k) / 2
+    for sh in picks:
+        el = _copy.deepcopy(sh.element)
+        # 預留位置改成一般圖形（不再繼承版面）
+        for ph in el.iter(H.qn("p:ph")):
+            ph.getparent().remove(ph)
+            pr = el.find(H.qn("p:spPr"))
+            if pr is not None and pr.find(H.qn("a:prstGeom")) is None and pr.find(H.qn("a:custGeom")) is None:
+                from lxml import etree
+                g = etree.Element(H.qn("a:prstGeom"), prst="rect")
+                etree.SubElement(g, H.qn("a:avLst"))
+                first = pr[0] if len(pr) else None  # 順序：xfrm 之後、填色之前
+                pr.insert(1 if first is not None and first.tag == H.qn("a:xfrm") else 0, g)
+            break
+        s.shapes._spTree.append(el)
+        _set_xfrm(el, int(ox + (sh.left - l0) * k), int(y * E + (sh.top - t0) * k), int(sh.width * k), int(sh.height * k))
+        # 圖片的關聯要重新建立
+        for blip in el.iter(H.qn("a:blip")):
+            rid = blip.get(H.qn("r:embed"))
+            if rid and rid in sl.part.rels:
+                blob = sl.part.related_part(rid).blob
+                _, new_rid = s.part.get_or_add_image_part(io.BytesIO(blob))
+                blip.set(H.qn("r:embed"), new_rid)
+        # 縮小時字也跟著縮；沒設字級的（原本繼承版面）給 14pt 起算
+        if k < 0.98:
+            for r in el.iter(H.qn("a:rPr")):
+                sz = r.get("sz")
+                r.set("sz", str(max(700, int((int(sz) if sz else 1400) * k))))
 
 
 PAIR = re.compile(r"([^:：\s][^:：]*?)\s*[:：]\s*([-+]?\d[\d,]*(?:\.\d+)?)\s*([%％]|[^\s\d:：]{1,2})?(?=\s|$)")
@@ -93,9 +268,13 @@ def analyze(src, n, total, agenda_items):
         e["kind"] = "chart"
     elif tables:
         e["kind"] = "table"
+    elif is_graphic(sl):
+        e["kind"] = "graphic"
+    elif titles and not cards and not pictures(n):
+        e["kind"] = "section"
     else:
         e["kind"] = "text"
-    if e["kind"] in ("table", "chart", "text"):
+    if e["kind"] in ("table", "chart", "text", "graphic", "section"):
         t0, sub = _titles(titles, agenda_items)
         e["title"] = t0
         if sub:
@@ -386,16 +565,36 @@ def render_page(e, notes):
         dates = [r for r in rest if date_re.search(r)]
         others = [r for r in rest if r not in dates]
         s = H.new_slide("cover", title)
+        t_ = s.shapes.title
+        if t_ is not None and t_.width:
+            tw_ = t_.width / H.EMU - 0.3
+            size_ = min(54, 2 * tw_ * 72 / max(H.text_w(title, 1), 1))  # 最多兩行
+            if H.text_w(title, 54) > tw_ * 72:
+                for p_ in t_.text_frame.paragraphs:
+                    for r_ in p_.runs:
+                        r_.font.size = Pt(max(24, int(size_)))
         from pptx.enum.shapes import PP_PLACEHOLDER as P
         nsub = len([ph for ph in s.placeholders if ph.placeholder_format.type in (P.SUBTITLE, P.BODY)])
         sub, date = e.get("subtitle", "　".join(others)), e.get("date", "　".join(dates))
+        phs = []
         if nsub >= 2:
             if sub:
-                H.set_subtitle(s, sub)
+                phs.append(H.set_subtitle(s, sub))
             if date:
-                H.set_subtitle(s, date, nth=1)
+                phs.append(H.set_subtitle(s, date, nth=1))
         elif sub or date:  # 範本封面只有一個副標位置：分兩行放
-            H.set_subtitle(s, "\n".join(x for x in (sub, date) if x))
+            phs.append(H.set_subtitle(s, "\n".join(x for x in (sub, date) if x)))
+        for ph in phs:  # 副標字太多：縮小字到放得下（最小 12pt）
+            if ph is None or not ph.width or not ph.height:
+                continue
+            text = ph.text_frame.text
+            size = 24
+            while size > 12 and H.est_h([(t, size, 0) for t in text.split("\n")], ph.width / H.EMU - 0.2) > ph.height / H.EMU:
+                size -= 2
+            if size < 24:
+                for p_ in ph.text_frame.paragraphs:
+                    for r_ in p_.runs:
+                        r_.font.size = Pt(size)
         return
     if kind == "closing":
         lines = H.src_title(n) + [x for c in H.src_cards(n) for x in ([c[0]] if c[0] else []) + c[1]]
@@ -414,6 +613,8 @@ def render_page(e, notes):
         s = H.new_slide("section", e.get("title", ""))
         if s is None:
             s = H.new_slide("content", e.get("title", ""))
+        if e.get("subtitle"):
+            H.set_subtitle(s, e["subtitle"])
         return
     s = H.new_slide(e.get("layout", "content"), e.get("title", ""))
     if e.get("subtitle"):
@@ -428,8 +629,24 @@ def render_page(e, notes):
             y += hh + 0.1
         H.column_chart(s, area=(x, y, w, h - (y - H.content_area(s)[1])), **H.src_chart(n))
         return
+    if kind == "graphic":
+        copy_graphic(s, H.src.slides[n - 1], (x, y, w, h))
+        return
+    pics = [] if e.get("pictures") == "none" else pictures(n)
     if kind == "table":
         blocks, side, _ = blocks_for(n, e)
+        if pics:  # 表格頁有圖：圖放右邊一欄（有側欄時放在側欄下方）
+            pw = float(e.get("picture_width", w * 0.35))
+            px = x + w - pw
+            py = y
+            if side:
+                sh_ = min(h * 0.45, 0.6 + 0.4 * sum(1 + len(c["items"]) for c in side))
+                side_panel(s, side, px, y, pw, sh_)
+                py = y + sh_ + 0.2
+            place_pictures(s, pics, px, py, pw, y + h - py)
+            build_flow(s, e, blocks, (x, y, w - pw - 0.25, h))
+            notes += e.pop("_notes", [])
+            return
         if side:
             sw = float(e.get("side_width", 3.4))
             build_flow(s, e, blocks, (x, y, w - sw - 0.25, h))
@@ -442,6 +659,16 @@ def render_page(e, notes):
     blocks, _, cards = blocks_for(n, e, side_ok=False)
     other = [b for b in blocks if b["type"] != "text"]
     txt_blocks = [b for b in blocks if b["type"] == "text"]
+    if pics:
+        if not blocks:  # 只有圖：整個內容區放圖
+            place_pictures(s, pics, x, y, w, h)
+            return
+        # 文字在左、圖在右；文字少時文字欄窄一點
+        chars = sum(len(t) for b in txt_blocks for t in b["lines"] + [b.get("head") or ""])
+        tw = float(e.get("text_width", w * (0.32 if chars < 120 else 0.42)))
+        place_pictures(s, pics, x + tw + 0.3, y, w - tw - 0.3, h)
+        w = tw
+        e = dict(e, cols=1)
     if other:  # 先放數字卡片、數字表
         x0, y0, w0, h0 = x, y, w, h
         build_flow(s, e, other, (x0, y0, w0, h0))
@@ -451,17 +678,25 @@ def render_page(e, notes):
     groups = [(b.get("head") or "", b["lines"]) for b in txt_blocks]
     with_items = [g for g in groups if g[1]]
     heads_only = [g[0] for g in groups if not g[1] and g[0]]
+    if len(with_items) == 1 and len(with_items[0][1]) >= 6:
+        hd, its = with_items[0]
+        need = H.est_h([(t, 12, 6) for t in its], w - 0.6) + 0.9
+        if need > h and not e.get("cols"):  # 一張卡片放不下：分成左右兩欄
+            half = (len(its) + 1) // 2
+            with_items = [(hd, its[:half]), ("", its[half:])]
+            e = dict(e, cols=2)
     if with_items:
         cols = int(e.get("cols", 2))
         if len(with_items) == 1:
             cols = 1
-        H.card_grid(s, with_items, cols=cols, area=(x, y, w, h - (0.4 if heads_only else 0)))
+        H.card_grid(s, with_items, cols=cols, area=(x, y, w, h - (0.4 if heads_only else 0)), min_size=9)
         y_end = max((sh.top + sh.height) / H.EMU for sh in s.shapes if sh.top is not None)
     else:
         y_end = y
     if heads_only:  # 只有標題沒有內容的區塊：只放標題，不補「無」
-        H.txt(s, x, min(y_end + 0.15, H.slide_size()[1] - 0.8), w, 0.4,
-              [dict(text=t, size=12, bold=True, color=H.NAVY, after=2) for t in heads_only])
+        ps = [dict(text=t, size=12, bold=True, color=H.NAVY, after=2) for t in heads_only]
+        hh = H.est_h([(p["text"], p["size"], p["after"]) for p in ps], w - 0.1) + 0.1
+        H.txt(s, x, min(y_end + 0.15, H.slide_size()[1] - 0.3 - hh), w, hh, ps)
 
 
 # ---------------------------------------------------------------- 主程式
@@ -470,16 +705,44 @@ def report(src, out_path, notes, png, work):
     from pptx import Presentation
     out = Presentation(out_path)
     issues = []
-    issues += H.overlap_check(out)
+    owner = getattr(H, "OWNER_OVERRIDE", None) or []
+    kind_of = {e["src"] - 1: e.get("kind") for e in PLAN["pages"]}
+    out_kind = {i + 1: kind_of.get(o) for i, o in enumerate(owner)}
+
+    def keep(m):
+        mm = re.match(r"第 (\d+) 頁：", m)
+        if not mm:
+            return True
+        k = out_kind.get(int(mm.group(1)))
+        if k == "graphic" and ("重疊" in m or "超出" in m):
+            return False  # 圖解頁照來源的相對位置搬，本來就疊在一起（例如圖上的標註）
+        if k in ("cover", "graphic") and "一整串清單" in m:
+            return False
+        return True
+    issues += [m for m in H.overlap_check(out) if keep(m)]
     issues += H.chart_check(src, out)
     issues += H.moved_text(src, out)
-    issues += H.structure_check(src, out)
+    issues += [m for m in H.structure_check(src, out) if keep(m)]
     miss = H.missing_text(src, out)
     closing_src = [p["src"] for p in PLAN["pages"] if p.get("kind") == "closing"]
     for no, toks in miss.items():
         if no in closing_src:
             continue
         issues.append(f"MISSING 來源第 {no} 頁：" + "、".join(toks[:15]) + (f" …等 {len(toks)} 處" if len(toks) > 15 else ""))
+    # 圖片：來源每頁要搬的圖，輸出對應的頁面要有一樣多
+    for e in PLAN["pages"]:
+        if e.get("kind") in ("cover", "closing", "skip", "agenda", "section", "custom"):
+            continue
+        k = len(pictures(e["src"]))
+        if not k:
+            continue
+        got = sum(1 for i, o in enumerate(owner) if o == e["src"] - 1 and i < len(out.slides)
+                  for sh in out.slides[i].shapes if _is_pic(sh))
+        if got < k:
+            if e.get("pictures") == "none":
+                notes.append(f"來源第 {e['src']} 頁的 {k} 張圖依計畫沒有放（pictures=none）")
+            else:
+                issues.append(f"來源第 {e['src']} 頁有 {k} 張圖，輸出只有 {got} 張：圖片不可以省略")
     issues += [w for w in H.warn if not w.startswith("overflow?")]
     issues += [w for w in H.warn if w.startswith("overflow?")]
     png_issues = []
@@ -535,6 +798,7 @@ def main():
     if os.path.abspath(a.out) in (os.path.abspath(a.src), os.path.abspath(a.tpl)):
         sys.exit("輸出檔不可以和來源或範本同名（不要覆蓋原始檔）")
     src, prs = H.init(a.src, a.tpl)
+    find_decor(src)
     if a.plan:
         PLAN = json.load(open(a.plan, encoding="utf-8"))
         print(f"使用計畫：{a.plan}")
@@ -549,7 +813,9 @@ def main():
         extra = "".join(f" {k}={e[k]}" for k in ("title", "subtitle", "cols", "side") if e.get(k))
         print(f"  來源第 {e['src']:>2} 頁 → {e['kind']}{extra}")
     notes = []
+    owner = []  # 每個輸出頁對應的來源頁（0 起算），給檢查用
     for e in PLAN["pages"]:
+        before = len(H.prs.slides)
         if e.get("kind") not in KINDS:
             sys.exit(f"plan.json 第 {e.get('src')} 頁的 kind「{e.get('kind')}」不認得，可用：{', '.join(KINDS)}")
         try:
@@ -558,6 +824,8 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(f"產生來源第 {e.get('src')} 頁時出錯：{ex}。在 plan.json 把這頁改成別的 kind（或 custom）再試")
+        owner += [e.get("src", 1) - 1] * (len(H.prs.slides) - before)
+    H.OWNER_OVERRIDE = owner
     for sid in H.orig_ids:
         H.prs.part.drop_rel(sid.rId)
         H.prs.slides._sldIdLst.remove(sid)

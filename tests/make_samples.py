@@ -44,6 +44,22 @@ def table(s, x, y, w, h, rows, red=()):
     return t
 
 
+def png(w, h, color, label=""):
+    """產生一張假的截圖（PNG bytes）。"""
+    import io
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", (w, h), color)
+    d = ImageDraw.Draw(im)
+    d.rectangle([10, 10, w - 10, 40], fill=(255, 255, 255))
+    d.text((20, 18), label, fill=(0, 0, 0))
+    for k in range(60, h - 20, 30):
+        d.rectangle([20, k, w - 20, k + 14], fill=(235, 235, 235))
+    bio = io.BytesIO()
+    im.save(bio, "PNG")
+    bio.seek(0)
+    return bio
+
+
 def blank(prs):
     return prs.slides.add_slide(prs.slide_layouts[6])
 
@@ -110,9 +126,24 @@ def make_a(path):
     s.shapes.title.text = "費用說明"
     tb(s, 0.8, 1.5, 11, 5, ["差旅費較上季增加 8%，主因海外展覽", "設備維修費持平", "訓練費用依計畫執行",
                             "辦公用品改為集中採購，預計每季節省 5%", "水電費因夏季用電增加 12%"], size=16)
-    # 9 結尾
+    # 9 SOP：步驟文字＋一張截圖
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "操作步驟"
+    tb(s, 0.6, 1.5, 4.5, 3, ["Step 1. 開啟設定畫面", "Step 2. 輸入參數", "Step 3. 按下儲存"], size=16)
+    s.shapes.add_picture(png(900, 600, (70, 110, 160), "Settings"), Inches(5.5), Inches(1.5), Inches(7), Inches(4.7))
+    # 10 只有兩張截圖
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "畫面比較"
+    s.shapes.add_picture(png(800, 500, (120, 160, 90), "Before"), Inches(0.5), Inches(1.6), Inches(6), Inches(3.75))
+    s.shapes.add_picture(png(800, 500, (160, 100, 90), "After"), Inches(6.8), Inches(1.6), Inches(6), Inches(3.75))
+    # 11 結尾
     s = blank(prs)
     tb(s, 4, 3, 5, 1, ["謝謝聆聽"], size=40, bold=True)
+    # 每頁右下角的 logo（裝飾，不應該被搬）
+    logo = png(200, 80, (200, 30, 30), "LOGO").getvalue()
+    import io
+    for sl in prs.slides:
+        sl.shapes.add_picture(io.BytesIO(logo), Inches(11.8), Inches(6.8), Inches(1.2), Inches(0.5))
     prs.save(path)
 
 
@@ -150,7 +181,18 @@ def make_b(path):
     tb(s, 0.8, 1.6, 4, 0.5, ["本月良率：98.6%"], size=18)
     tb(s, 5, 1.6, 4, 0.5, ["目標：98%"], size=18)
     tb(s, 0.8, 2.6, 8, 2, ["連續三個月達標", "主要改善：焊接參數調整"], size=14)
-    # 6 結尾（用版面的標題）
+    # 6 流程圖（文字在圖形裡＋連接線）：要整組搬，不重排
+    from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
+    s = prs.slides.add_slide(prs.slide_layouts[5])
+    s.shapes.title.text = "異常處理流程"
+    boxes = []
+    for i, label in enumerate(["發現異常", "隔離產品", "原因分析", "改善驗證"]):
+        b = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.4 + i * 2.4), Inches(3), Inches(1.9), Inches(1))
+        b.text_frame.text = label
+        boxes.append(b)
+    for a, b in zip(boxes, boxes[1:]):
+        c = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, a.left + a.width, a.top + a.height // 2, b.left, b.top + b.height // 2)
+    # 7 結尾（用版面的標題）
     s = prs.slides.add_slide(prs.slide_layouts[5])
     s.shapes.title.text = "Q&A"
     prs.save(path)

@@ -144,6 +144,7 @@ src = None          # source deck (content is read from here)
 prs = None          # output deck, opened from the template
 L = {}              # template layout name -> layout
 orig_ids = []       # template sample slides, removed by save()
+BOILER = set()      # 來源很多頁都有的同一行字（頁尾、版權、公司標語），不當內容
 TPL_PATH = None     # template path (structure_check 用：範本本來就有的字不算自己加的)
 warn = []           # overflow warnings collected by txt()
 # powerpoint-pptx 技能的工具（讀簡報、匯出圖片）：和本技能資料夾在同一層
@@ -157,6 +158,7 @@ def init(src_path, tpl_path, theme=True):
     global src, prs, TPL_PATH
     TPL_PATH = tpl_path
     src = Presentation(src_path) if src_path else None
+    _compute_boiler(src)
     prs = Presentation(tpl_path)
     # 就地更新（不要重新指定）：`from helpers import *` 拿到的 L、orig_ids 才不會是空的舊物件
     orig_ids[:] = list(prs.slides._sldIdLst)
@@ -348,6 +350,30 @@ def chart_check(src_pres, out_pres):
 _SKIP_PH = (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.DATE)
 
 
+def _is_noise(t):
+    """頁碼欄位、重複的頁尾字。"""
+    t = t.strip()
+    return not t or t in BOILER or t in ("‹#›", "<#>") or bool(re.fullmatch(r"\d{1,3}\s*/\s*\d{1,3}", t))
+
+
+def _compute_boiler(pres):
+    """出現在 3 頁以上、超過 4 成頁面的同一行字 → 頁尾/版權字，不當內容。"""
+    from collections import Counter
+    BOILER.clear()
+    if pres is None or len(pres.slides) < 3:
+        return
+    cnt = Counter()
+    for sl in pres.slides:
+        seen = set()
+        for sh_ in walk_shapes(sl.shapes):
+            if sh_.has_text_frame:
+                seen |= {x.strip() for p in sh_.text_frame.paragraphs
+                         for x in p.text.replace("\x0b", "\n").split("\n") if x.strip()}
+        cnt.update(seen)
+    n = len(pres.slides)
+    BOILER.update(k for k, v in cnt.items() if v >= 3 and v >= 0.4 * n)
+
+
 def _texts_of(shapes, tables=True):
     """依閱讀順序（上→下、左→右）回傳 (top, left, 文字) list；群組會進入，換行拆成多段。"""
     out = []
@@ -358,7 +384,7 @@ def _texts_of(shapes, tables=True):
         if sh_.has_text_frame:
             for p in sh_.text_frame.paragraphs:
                 for part in p.text.replace("\x0b", "\n").split("\n"):
-                    if part.strip():
+                    if part.strip() and not _is_noise(part):
                         out.append((round(top, 2), round(left, 2), part.strip()))
         elif tables and getattr(sh_, "has_table", False) and sh_.has_table:
             for r in sh_.table.rows:
@@ -396,7 +422,10 @@ def _abs_boxes(shapes, tf=(0.0, 0.0, 1.0, 1.0)):
 
 
 def _lines(sh_):
-    return [norm(x) for p in sh_.text_frame.paragraphs for x in p.text.replace("\x0b", "\n").split("\n") if x.strip()]
+    if sh_.is_placeholder and sh_.placeholder_format.type in _SKIP_PH:
+        return []
+    return [norm(x) for p in sh_.text_frame.paragraphs for x in p.text.replace("\x0b", "\n").split("\n")
+            if x.strip() and not _is_noise(x)]
 
 
 def src_title(slide_no):
@@ -438,8 +467,8 @@ def src_cards(slide_no, pos=False):
     for sh_, l, t, w, h in _abs_boxes(src.slides[slide_no - 1].shapes):
         if getattr(sh_, "has_table", False):
             continue
-        ln = _lines(sh_)
-        if not ln or (len(ln) == 1 and ln[0] in titles and t < 0.6) or (
+        ln = [x for x in _lines(sh_) if x != str(slide_no)]  # 文字框裡的頁碼
+        if not ln or (len(ln) == 1 and ln[0] in titles) or (
                 sh_.is_placeholder and sh_.placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)):
             continue
         rec = dict(l=l, t=t, r=l + w, b=t + h, lines=ln)
@@ -540,7 +569,7 @@ def missing_text(src_pres, out_pres):
         for _, _, t in _texts_of(sl.shapes):
             for tok in (x for part in _SEP.split(t) for x in _RUN.findall(part)):
                 tok = tok.strip(".。").lower()
-                if len(tok) < 2 and not tok.isdigit():
+                if (len(tok) < 2 and not tok.isdigit()) or tok == str(no):
                     continue
                 if tok not in blob and tok not in seen:
                     seen.append(tok)
@@ -605,7 +634,7 @@ def structure_check(src_pres, out_pres):
         nums = []
         for _, _, t in _texts_of(sl.shapes):
             for tok in re.findall(r"\d+(?:\.\d+)?%?", t):
-                if len(tok.rstrip("%")) >= 2 and tok not in b and tok not in nums:
+                if len(tok.rstrip("%")) >= 2 and tok not in b and tok not in nums and tok != str(i + 1):
                     nums.append(tok)
         if nums:
             msgs.append(f"來源第 {i + 1} 頁的數字在輸出第 " + "、".join(str(k + 1) for k in mine) + " 頁找不到："
@@ -673,6 +702,9 @@ def _owners(src_pres, out_pres):
     """回傳 (每個來源頁的字, 每個輸出頁的文字, 每個輸出頁對應的來源頁 index 或 None)。"""
     src_t = [_toks(sl) for sl in src_pres.slides]
     out_b = [re.sub(r"\s+", "", "".join(t for _, _, t in _texts_of(sl.shapes))).lower() for sl in out_pres.slides]
+    ov = globals().get("OWNER_OVERRIDE")
+    if ov and len(ov) == len(out_b):  # auto_build 知道確切的對應，就不用猜
+        return src_t, out_b, list(ov)
     # 輸出頁照來源順序排：用動態規劃找「來源頁碼不倒退」且共同字總數最多的對應
     scores = [[sum(1 for t in ts if t in b) for ts in src_t] for b in out_b]
     ks = [k for k, sc in enumerate(scores) if sc and max(sc) >= 2]
@@ -868,7 +900,13 @@ def txt(s, x, y, w, h, paras, anchor=MSO_ANCHOR.TOP, align=PP_ALIGN.LEFT, margin
         est.append((full, p.get("size", 14), p.get("after", 0)))
     need = est_h(est, w - 2 * margin) + 0.06
     if need > h + 0.02:
-        warn.append(f"overflow? '{est[0][0][:20]}' need {need:.2f} > {h:.2f}")
+        try:
+            pg = list(prs.slides).index(s) + 1 - len(orig_ids)
+            where = f"第 {pg} 頁："
+        except Exception:
+            where = ""
+        warn.append(f"overflow? {where}'{est[0][0][:20]}' need {need:.2f} > {h:.2f}"
+                    "（文字放不下：改 cols、分欄，或請使用者決定要不要拆頁）")
     if name: tb.name = name
     return tb
 
@@ -955,7 +993,11 @@ C = PP_ALIGN.CENTER
 def walk_shapes(shs):
     """Yield every non-group shape, descending into groups."""
     for sh_ in shs:
-        if sh_.shape_type == 6: yield from walk_shapes(sh_.shapes)
+        try:
+            grp = sh_.shape_type == 6
+        except NotImplementedError:  # 沒有圖形定義的圖形（例如複製過來的預留位置）
+            grp = False
+        if grp: yield from walk_shapes(sh_.shapes)
         else: yield sh_
 
 def bar_line_combo(chart, line_series_index, color=None, labels=True):
@@ -1228,7 +1270,7 @@ def agenda(s, items, gap=0.25):
         txt(s, cx + 0.2, cy + ch * 0.56, cw - 0.4, ch * 0.4, [dict(text=it, size=size, bold=True, color=NAVY)])
 
 
-def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None):
+def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None, min_size=10):
     """多張卡片排成格狀（例如 2×2）。cards：[(卡片標題, 項目 list), ...]；
     項目可以是字串，或 (主文字, 灰色補充說明)。回傳卡片的 (x, y, w, h) list。"""
     x, y, w, hh = area or content_area(s)
@@ -1249,7 +1291,7 @@ def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None
         return paras
     # 字級：所有卡片用同一個字級，放不下就縮小（最小 10pt），還是放不下 txt 會發出 overflow 警告
     bs = body_size
-    while bs > 10 and any(
+    while bs > min_size and any(
             est_h([(p["text"], p["size"], p["after"]) for p in build(items, bs)], cw - 0.5) + 0.06 > ch - 0.75
             for _, items in cards):
         bs -= 1
@@ -1262,7 +1304,12 @@ def card_grid(s, cards, cols=2, gap=0.23, title_size=18, body_size=14, area=None
         box(s, cx, cy, cw, ch, CLOUD)
         top = 0.65
         if ttl:
-            txt(s, cx + 0.2, cy + 0.12, cw - 0.4, 0.45, [dict(text=ttl, size=title_size, bold=True, color=BLUE)])
+            ts = title_size  # 小標太長：先縮字，再依行數加高
+            while ts > 12 and lines_needed(ttl, ts, cw - 0.5) > 2:
+                ts -= 2
+            th = lines_needed(ttl, ts, cw - 0.5) * ts * 1.3 / 72 + 0.1
+            txt(s, cx + 0.2, cy + 0.12, cw - 0.4, th, [dict(text=ttl, size=ts, bold=True, color=BLUE)])
+            top = 0.12 + th + 0.08
         else:
             top = 0.2  # 沒有小標：內容從上面開始，不留空白
         paras = build(items, bs)
